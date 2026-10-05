@@ -140,7 +140,8 @@ pub struct SshAttachOptions {
 /// Output from an SSH exec request.
 #[derive(Debug)]
 pub struct SshOutput {
-    /// Exit status code.
+    /// Exit status code: `128` if the server reported a signal, `-1` if it reported
+    /// neither a status nor a signal.
     pub status: i32,
 
     /// Captured stdout bytes.
@@ -682,7 +683,7 @@ impl SshClient {
         }
 
         Ok(SshOutput {
-            status: status.unwrap_or(0),
+            status: status.unwrap_or(-1),
             stdout: Bytes::from(stdout),
             stderr: Bytes::from(stderr),
         })
@@ -1284,9 +1285,13 @@ impl SshSession {
                         }
                     }
                     ExecEvent::Exited { code } => {
-                        let _ = session_handle
-                            .exit_status_request(channel, code.max(0) as u32)
-                            .await;
+                        // A negative code means the process did not exit normally, usually
+                        // because a signal killed it. The guest does not say which signal, so
+                        // send no status rather than report success: RFC 4254 makes it optional,
+                        // and OpenSSH clients then exit 255, as they do for `exit-signal`.
+                        if let Ok(code) = u32::try_from(code) {
+                            let _ = session_handle.exit_status_request(channel, code).await;
+                        }
                         let _ = session_handle.eof(channel).await;
                         let _ = session_handle.close(channel).await;
                         break;
