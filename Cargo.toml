@@ -96,8 +96,8 @@ microsandbox-runtime = { version = "=0.7.7", path = "crates/runtime", default-fe
 microsandbox-utils = { version = "=0.7.7", path = "crates/utils" }
 microsandbox-vsock = { version = "=0.7.7", path = "crates/vsock" }
 # Keep runtime APIs and shared metrics types on the same published release.
-msb_krun = "=0.1.40"
-msb_krun_utils = "=0.1.40"
+msb_krun = "=0.1.41"
+msb_krun_utils = "=0.1.41"
 test-macros = { path = "crates/testing/macros" }
 test-utils = { path = "crates/testing/utils" }
 
@@ -219,3 +219,19 @@ parking_lot = "0.12"
 rpassword = "7"
 russh = "0.63.1"
 russh-sftp = "2.3.0"
+
+# puddle fork: build against TijsVK/libkrun branch `puddle` (msb_krun 0.1.41 plus
+# the puddle fixes). 0.1.41 is not on crates.io, so the pin above and this
+# patch go together. Drop both once upstream pins a release with the fixes.
+[patch.crates-io]
+msb_krun = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_arch = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_arch_gen = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_cpuid = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_devices = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_hvf = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_kernel = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_polly = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_smbios = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_utils = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun_vmm = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
