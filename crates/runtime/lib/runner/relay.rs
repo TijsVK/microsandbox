@@ -823,12 +823,20 @@ impl GuestFrameMerger {
                 if finish.flow != BulkFlow::GuestToHost {
                     return Ok(vec![lane_frame]);
                 }
-                let flow = self.flows.get_mut(&key).ok_or_else(|| {
-                    RuntimeError::Custom(format!(
+                let Some(flow) = self.flows.get_mut(&key) else {
+                    // agentd queues a TCP finish behind the guest's socket EOF but writes a
+                    // cancel's terminal directly, so the finish can trail a retired operation.
+                    if self.is_retired(incarnation, message.id) {
+                        return Ok(Vec::new());
+                    }
+                    return Err(RuntimeError::Custom(format!(
                         "bulk finish arrived before acceptance for correlation {}",
                         message.id
-                    ))
-                })?;
+                    )));
+                };
+                if flow.cancelling {
+                    return Ok(Vec::new());
+                }
                 if !flow.accepted_forwarded || !flow.guest_to_host {
                     return Err(RuntimeError::Custom(format!(
                         "bulk finish arrived for inactive guest-to-host flow {}",
@@ -6378,6 +6386,115 @@ mod tests {
         assert_eq!(terminal.len(), 1);
         assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
         assert!(merger.register(TEST_INCARNATION, id).is_err());
+    }
+
+    #[test]
+    fn guest_merger_discards_tcp_finish_that_trails_a_cancel_terminal() {
+        let id = 71;
+        let budget = Arc::new(Semaphore::new(64 * 1024));
+        let mut merger = GuestFrameMerger::default();
+        merger.register(TEST_INCARNATION, id).unwrap();
+        merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::BulkAccepted,
+                    id,
+                    &BulkAccepted {
+                        kind: BulkKind::Tcp,
+                        ..bulk_accepted()
+                    },
+                ),
+                &budget,
+            ))
+            .unwrap();
+
+        // The SDK closed its channel: the relay cut the flow before forwarding the cancel, and
+        // agentd answered with the cancel's terminal. A finish that agentd queued when the guest
+        // socket reached EOF can still follow that terminal on the control lane.
+        merger.drop_flow(TEST_INCARNATION, id);
+        let terminal = merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::TcpFailed,
+                    id,
+                    &TcpFailed {
+                        error: "SSH direct-tcpip channel was closed".into(),
+                    },
+                ),
+                &budget,
+            ))
+            .unwrap();
+        assert_eq!(terminal.len(), 1);
+        assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
+
+        let late_finish = merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::BulkFinish,
+                    id,
+                    &BulkFinish {
+                        kind: BulkKind::Tcp,
+                        flow: BulkFlow::GuestToHost,
+                        final_offset: 0,
+                    },
+                ),
+                &budget,
+            ))
+            .unwrap();
+        assert!(late_finish.is_empty());
+    }
+
+    #[test]
+    fn guest_merger_discards_tcp_finish_for_a_cancelling_flow() {
+        let id = 73;
+        let budget = Arc::new(Semaphore::new(64 * 1024));
+        let mut merger = GuestFrameMerger::default();
+        merger.register(TEST_INCARNATION, id).unwrap();
+        merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::BulkAccepted,
+                    id,
+                    &BulkAccepted {
+                        kind: BulkKind::Tcp,
+                        ..bulk_accepted()
+                    },
+                ),
+                &budget,
+            ))
+            .unwrap();
+        merger.drop_flow(TEST_INCARNATION, id);
+
+        let finish = merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::BulkFinish,
+                    id,
+                    &BulkFinish {
+                        kind: BulkKind::Tcp,
+                        flow: BulkFlow::GuestToHost,
+                        final_offset: 0,
+                    },
+                ),
+                &budget,
+            ))
+            .unwrap();
+        assert!(finish.is_empty());
+
+        let terminal = merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::TcpFailed,
+                    id,
+                    &TcpFailed {
+                        error: "SSH direct-tcpip channel was closed".into(),
+                    },
+                ),
+                &budget,
+            ))
+            .unwrap();
+        assert_eq!(terminal.len(), 1);
+        assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
     }
 
     #[test]
