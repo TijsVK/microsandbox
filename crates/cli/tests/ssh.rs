@@ -300,6 +300,64 @@ async fn msb_ssh_serve_reports_sftp_exit_status_to_scp() {
     assert_eq!(downloaded.expect("read downloaded file"), b"scp-ok");
 }
 
+#[msb_test]
+async fn msb_ssh_serve_does_not_report_signal_killed_command_as_success() {
+    if !command_exists("ssh") {
+        eprintln!("skipping OpenSSH exit status test; ssh is not installed");
+        return;
+    }
+
+    let name = "cli-ssh-signal-status";
+    let sandbox = Sandbox::builder(name)
+        .image("mirror.gcr.io/library/alpine")
+        .cpus(1)
+        .memory(512)
+        .replace()
+        .create()
+        .await
+        .expect("create sandbox");
+
+    let temp = make_temp_dir("msb-ssh-signal");
+    let key_path = temp.join("id_ed25519");
+    let authorized_key = write_test_key(&key_path);
+    command_ok(
+        Command::new(env!("CARGO_BIN_EXE_msb")).args([
+            "ssh",
+            "authorize",
+            "--key",
+            &authorized_key,
+        ]),
+        "authorize OpenSSH test key",
+    )
+    .expect("authorize OpenSSH test key");
+
+    let exited = openssh_command("ssh", name, &key_path)
+        .args(["root@msb-signal", "exit 7"])
+        .output()
+        .expect("run OpenSSH exit command");
+    let killed = openssh_command("ssh", name, &key_path)
+        .args(["root@msb-signal", "kill -9 $$"])
+        .output()
+        .expect("run OpenSSH killed command");
+
+    cleanup_sandbox(sandbox, name).await;
+    let _ = std::fs::remove_dir_all(&temp);
+
+    assert_eq!(
+        exited.status.code(),
+        Some(7),
+        "stderr={}",
+        String::from_utf8_lossy(&exited.stderr)
+    );
+    // OpenSSH exits 255 when the server sends `exit-signal` or no status at all.
+    assert_eq!(
+        killed.status.code(),
+        Some(255),
+        "stderr={}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
