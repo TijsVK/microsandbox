@@ -43,6 +43,24 @@ async fn ssh_exec_preserves_status_stdout_and_stderr() {
 }
 
 #[msb_test]
+async fn ssh_exec_does_not_report_signal_killed_command_as_success() {
+    let name = "ssh-exec-signal";
+    let sandbox = create_sandbox(name).await;
+    let ssh = sandbox
+        .ssh()
+        .open_client()
+        .await
+        .expect("connect SSH client");
+
+    let output = ssh.exec("kill -9 $$").await.expect("run SSH exec");
+
+    ssh.close().await.expect("close SSH client");
+    cleanup(sandbox, name).await;
+
+    assert_eq!(output.status, -1);
+}
+
+#[msb_test]
 async fn ssh_exec_with_pty_merges_stderr_into_stdout() {
     let name = "ssh-exec-pty";
     let sandbox = create_sandbox(name).await;
