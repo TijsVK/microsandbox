@@ -78,7 +78,7 @@ pub(crate) struct SandboxTransitionGuard {
     _file: File,
 }
 
-/// Removes direct archive staging unless creation reaches durable sandbox state.
+/// Removes child storage created by this create unless creation reaches durable sandbox state.
 struct ChildStageGuard {
     path: PathBuf,
     armed: bool,
@@ -110,7 +110,7 @@ impl Drop for ChildStageGuard {
             tracing::warn!(
                 error = %error,
                 path = %self.path.display(),
-                "failed to remove direct archive child staging"
+                "failed to remove uncommitted sandbox storage"
             );
         }
     }
@@ -647,6 +647,12 @@ impl LocalBackend {
                 _ => None,
             };
 
+            // The name was reserved as absent above, so this create owns the directory until
+            // the sandbox row does. Without a row, `ls` and `remove` cannot see the directory,
+            // yet it alone blocks a retry under the same name.
+            if child_stage_guard.is_none() {
+                child_stage_guard = Some(ChildStageGuard::new(sandbox_dir.clone()));
+            }
             // Flat patches modify a complete private tree. Managed patches remain a compact
             // OverlayFS upper and therefore retain their existing fast path.
             tokio::fs::create_dir_all(&sandbox_dir).await?;
@@ -3057,6 +3063,105 @@ mod tests {
         // A rejected create must leave no sandbox name behind, otherwise retries under
         // the same name fail with "sandbox already exists" (see #1550).
         assert!(!backend.sandboxes_dir().join("patched-snapshot").exists());
+    }
+
+    #[tokio::test]
+    async fn test_create_local_rejected_named_volume_leaves_no_directory() {
+        use crate::db::entity::volume as volume_entity;
+        use crate::sandbox::SandboxBuilder;
+        use crate::volume::VolumeKind;
+
+        // Keep Unix socket paths short; Windows uses named pipes instead.
+        let temp_root = if cfg!(windows) {
+            std::env::temp_dir()
+        } else {
+            std::path::PathBuf::from("/tmp")
+        };
+        let temp = tempfile::Builder::new()
+            .prefix("msb")
+            .tempdir_in(temp_root)
+            .unwrap();
+        let backend = Arc::new(
+            crate::test_support::local_backend_builder(temp.path().join("home"))
+                .build()
+                .await
+                .unwrap(),
+        );
+
+        // A complete cached image with no layers, so the create reaches sandbox storage
+        // without a registry.
+        let reference = "registry.invalid/rejected-volume:latest";
+        let manifest_digest: microsandbox_image::Digest =
+            format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+        let cache = microsandbox_image::GlobalCache::new(&backend.cache_dir()).unwrap();
+        cache
+            .write_image_metadata_async(
+                &reference.parse().unwrap(),
+                &microsandbox_image::CachedImageMetadata {
+                    manifest_digest: manifest_digest.to_string(),
+                    config_digest: format!("sha256:{}", "b".repeat(64)),
+                    raw_manifest_json: r#"{"schemaVersion":2,"layers":[]}"#.into(),
+                    raw_config_json: serde_json::json!({
+                        "architecture": "amd64",
+                        "os": "linux",
+                        "rootfs": { "type": "layers", "diff_ids": [] },
+                    })
+                    .to_string(),
+                    config: Default::default(),
+                    layers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        microsandbox_image::erofs::write_erofs(
+            &microsandbox_image::tree::FileTree::new(),
+            &cache.fsmeta_erofs_path(&manifest_digest),
+        )
+        .unwrap();
+        fs::write(cache.vmdk_path(&manifest_digest), b"# VMDK fixture").unwrap();
+
+        // An existing 64 MiB disk volume, requested below with a different size.
+        let pools = backend.db().await.unwrap();
+        volume_entity::Entity::insert(volume_entity::ActiveModel {
+            name: Set("rejected-disk".into()),
+            kind: Set(VolumeKind::Disk.as_str().to_string()),
+            capacity_bytes: Set(Some(64 * 1024 * 1024)),
+            disk_format: Set(Some("raw".into())),
+            disk_fstype: Set(Some("ext4".into())),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+
+        let input = SandboxBuilder::new("rejected-volume")
+            .image(reference)
+            .pull_policy(PullPolicy::Never)
+            .volume("/data", |mount| {
+                mount.named_with("rejected-disk", |volume| {
+                    volume.ensure_exists().disk().size(128_u32)
+                })
+            });
+        let error = match backend
+            .create_sandbox(backend.clone(), input, SpawnMode::Attached, None)
+            .await
+        {
+            Ok(_) => panic!("a disk volume must not be reused with a different size"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("already exists with capacity"),
+            "{error}"
+        );
+        // The volume is rejected after the sandbox directory and its writable upper were
+        // created. Without a sandbox row, a leftover directory would block every retry
+        // under this name while `ls` and `remove` report the sandbox as missing.
+        let sandbox_dir = backend.sandboxes_dir().join("rejected-volume");
+        assert!(!sandbox_dir.exists());
+        LocalBackend::check_create_target(pools, "rejected-volume", &sandbox_dir)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
