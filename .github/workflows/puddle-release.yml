@@ -1,0 +1,348 @@
+# puddle fork: build msb.exe for Windows (MSVC) from a v<release>-puddle.N tag, test it,
+# and publish it as a release asset next to upstream's libkrunfw.dll and agentd.
+#
+# Fork-only file (not in upstream). Kernel, libkrunfw and agentd stay upstream's: they are
+# downloaded from the matching upstream release and checked against its checksums.sha256.
+#
+# Triggers:
+# * push of a tag v*-puddle.* whose commit contains this file: build, test, publish.
+# * workflow_dispatch with a tag (for tags made before this file existed): build and test;
+#   publish only when `publish` is true.
+name: puddle release
+
+on:
+  push:
+    tags: ["v*-puddle.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Fork tag to build, e.g. v0.7.7-puddle.2"
+        required: true
+        type: string
+      publish:
+        description: "Publish the GitHub release with the assets"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: puddle-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_INCREMENTAL: "0"
+  UPSTREAM_REPO: superradcompany/microsandbox
+  RUST_TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  prepare:
+    name: Upstream assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.tags.outputs.tag }}
+      version: ${{ steps.tags.outputs.version }}
+      upstream_tag: ${{ steps.tags.outputs.upstream_tag }}
+    steps:
+      - name: Resolve tags
+        id: tags
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-puddle\.[1-9][0-9]*$ ]]; then
+            echo "::error::$TAG is not a v<MAJOR.MINOR.PATCH>-puddle.<N> tag"
+            exit 1
+          fi
+          upstream="${TAG%-puddle.*}"
+          {
+            echo "tag=$TAG"
+            echo "version=${TAG#v}"
+            echo "upstream_tag=$upstream"
+          } >> "$GITHUB_OUTPUT"
+          echo "fork tag $TAG, upstream release $upstream"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/puddle
+
+      - name: Download upstream libkrunfw.dll, agentd, checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.tags.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p upstream
+          gh release download "$UPSTREAM_TAG" -R "$UPSTREAM_REPO" -D upstream \
+            -p checksums.sha256 -p libkrunfw-windows-x86_64.dll -p agentd-x86_64
+
+      - name: Verify against upstream checksums.sha256
+        run: |
+          set -euo pipefail
+          v=.github/puddle/verify-asset.sh
+          bash "$v" upstream/checksums.sha256 upstream/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+          bash "$v" upstream/checksums.sha256 upstream/agentd-x86_64 agentd-x86_64
+          # Self-test: a file with one byte changed must be refused.
+          cp upstream/agentd-x86_64 corrupted
+          printf '\x00' | dd of=corrupted bs=1 seek=4096 count=1 conv=notrunc status=none
+          if bash "$v" upstream/checksums.sha256 corrupted agentd-x86_64; then
+            echo "::error::verify-asset.sh accepted a corrupted file"
+            exit 1
+          fi
+          echo "self-test ok: corrupted file refused"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upstream-assets
+          path: upstream/
+          compression-level: 0
+
+  build-windows:
+    name: Build msb.exe + boot smoke (windows-2025)
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - name: Checkout libkrunfw MSVC helpers
+        shell: pwsh
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-release-windows
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: upstream/
+
+      # embed-binaries takes the prebuilt agentd from MSB_EMBED_ARTIFACTS_DIR (named `agentd`).
+      - name: Stage upstream agentd for embedding
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path embed | Out-Null
+          Copy-Item upstream\agentd-x86_64 embed\agentd -Force
+
+      # Upstream's MSVC steps (release-windows.yml "Build msb"), without download-binaries.
+      - name: Build msb
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          MSB_EMBED_ARTIFACTS_DIR: ${{ github.workspace }}\embed
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture amd64 -HostArchitecture amd64
+          cargo build --locked --release --no-default-features --features embed-binaries,net,ssh -p microsandbox-cli --target $env:RUST_TARGET
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item "target\$env:RUST_TARGET\release\msb.exe" out\msb-windows-x86_64.exe -Force
+          Copy-Item upstream\libkrunfw-windows-x86_64.dll out\libkrunfw-windows-x86_64.dll -Force
+
+      - name: Embedded agentd is upstream's
+        shell: pwsh
+        run: |
+          $want = (Get-FileHash upstream\agentd-x86_64 -Algorithm SHA256).Hash
+          $staged = Get-ChildItem "target\$env:RUST_TARGET\release\build" -Recurse -File -Filter agentd |
+            Where-Object { $_.FullName -match 'microsandbox-filesystem-[0-9a-f]+\\out\\agentd$' }
+          if (-not $staged) { throw "no staged agentd found under target\$env:RUST_TARGET\release\build" }
+          foreach ($f in $staged) {
+            $got = (Get-FileHash $f.FullName -Algorithm SHA256).Hash
+            "$($f.FullName): $got"
+            if ($got -ne $want) { throw "embedded agentd differs from upstream agentd-x86_64 ($want)" }
+          }
+          "embedded agentd = upstream agentd-x86_64 ($want)"
+
+      - name: Version and imports
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $line = (& out\msb-windows-x86_64.exe --version | Out-String).Trim()
+          "msb --version: $line"
+          if ($line -ne "msb $env:VERSION") { throw "msb --version printed '$line', want 'msb $env:VERSION'" }
+          python -m pip install --quiet --disable-pip-version-check pefile==2024.8.26
+          python _puddle\.github\puddle\check-msb-exe.py out\msb-windows-x86_64.exe $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "msb.exe checks failed" }
+
+      - name: Runtime discovery smoke (upstream script)
+        shell: pwsh
+        run: python scripts/smoke/cli/runtime-discovery.py --msb out/msb-windows-x86_64.exe --libkrunfw out/libkrunfw-windows-x86_64.dll
+
+      - name: Boot smoke (create, exec, stop, start, exec, remove)
+        shell: pwsh
+        run: ./_puddle/.github/puddle/boot-smoke.ps1 -Msb out\msb-windows-x86_64.exe -Libkrunfw out\libkrunfw-windows-x86_64.dll
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-windows-x86_64
+          path: out/msb-windows-x86_64.exe
+          compression-level: 0
+
+  test-windows:
+    name: Patched crates, Windows tests (windows-2025)
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-test-windows
+          workspaces: |
+            . -> target
+            libkrun -> target
+
+      # vsock tail-loss fix (msb half): its tests only run on Windows.
+      - name: microsandbox-vsock tests
+        shell: pwsh
+        run: |
+          cargo test --locked -p microsandbox-vsock
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-vsock tests failed" }
+
+      - name: Checkout the locked libkrun fork commit
+        id: krun
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=$(grep -m1 -o 'git+https://github.com/TijsVK/libkrun?branch=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
+          sha=${src##*#}
+          echo "libkrun source from Cargo.lock: $src"
+          git init -q libkrun
+          git -C libkrun fetch -q --depth 1 https://github.com/TijsVK/libkrun "$sha"
+          git -C libkrun checkout -q FETCH_HEAD
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # libkrun fixes: credit stall + tail-loss shutdown order (vsock), unplug zero-fill (mem, Windows-only tests).
+      - name: msb_krun_devices tests
+        shell: pwsh
+        working-directory: libkrun
+        run: |
+          cargo test --locked --manifest-path src/devices/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "msb_krun_devices tests failed" }
+
+  test-linux:
+    name: Patched crates, Linux tests
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-test-linux
+          workspaces: |
+            . -> target
+            libkrun -> target
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
+      # relay crash fix (runtime), stale dir + ssh fixes (SDK), ssh fixes (CLI).
+      - name: msb lib tests
+        run: |
+          set -euo pipefail
+          cargo test --locked -p microsandbox-runtime --lib
+          cargo test --locked -p microsandbox --features ssh --lib
+          cargo test --locked -p microsandbox-cli --lib
+
+      - name: Checkout the locked libkrun fork commit
+        run: |
+          set -euo pipefail
+          src=$(grep -m1 -o 'git+https://github.com/TijsVK/libkrun?branch=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
+          sha=${src##*#}
+          echo "libkrun source from Cargo.lock: $src"
+          git init -q libkrun
+          git -C libkrun fetch -q --depth 1 https://github.com/TijsVK/libkrun "$sha"
+          git -C libkrun checkout -q FETCH_HEAD
+
+      - name: msb_krun_devices virtio tests
+        working-directory: libkrun
+        run: cargo test --locked -p msb_krun_devices 'virtio::'
+
+  release:
+    name: Publish release
+    needs: [prepare, build-windows, test-windows, test-linux]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: upstream/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: msb-windows-x86_64
+          path: assets/
+
+      - name: Assemble assets and checksums
+        run: |
+          set -euo pipefail
+          cp upstream/libkrunfw-windows-x86_64.dll upstream/agentd-x86_64 assets/
+          cd assets
+          sha256sum msb-windows-x86_64.exe libkrunfw-windows-x86_64.dll agentd-x86_64 > checksums.sha256
+          cat checksums.sha256
+
+      - name: Create release and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; not overwriting its assets"
+            exit 1
+          fi
+          {
+            echo "puddle fork of microsandbox at \`$TAG\`: upstream [\`$UPSTREAM_TAG\`](https://github.com/$UPSTREAM_REPO/releases/tag/$UPSTREAM_TAG) plus the puddle patch stack (see the commits on top of \`$UPSTREAM_TAG\`)."
+            echo
+            echo "- \`msb-windows-x86_64.exe\`: built by [this run]($RUN_URL) with MSVC, static CRT, features \`embed-binaries,net,ssh\`, embedding upstream's agentd."
+            echo "- \`libkrunfw-windows-x86_64.dll\`, \`agentd-x86_64\`: unchanged from upstream \`$UPSTREAM_TAG\`, checked against its \`checksums.sha256\`."
+            echo "- \`checksums.sha256\`: SHA-256 of the three files above."
+            echo
+            echo "Not an official microsandbox release."
+          } > notes.md
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file notes.md \
+            assets/msb-windows-x86_64.exe assets/libkrunfw-windows-x86_64.dll assets/agentd-x86_64 assets/checksums.sha256
