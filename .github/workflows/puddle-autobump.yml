@@ -59,8 +59,9 @@ on:
 permissions:
   contents: read
 
+# Real runs one at a time; dry runs (which push nothing) in parallel.
 concurrency:
-  group: puddle-autobump
+  group: puddle-autobump-${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && github.run_id || 'real' }}
   cancel-in-progress: false
 
 env:
