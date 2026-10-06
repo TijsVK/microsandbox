@@ -23,6 +23,7 @@ pick      | fix(ssh): don't report signal-killed commands as success            
 pick      | fix(sandbox): remove storage of a rejected create                       | msb-stale-dir-on-failed-create          | -
 pick      | fix(vsock): write queued guest bytes before closing a named-pipe route  | msb-vsock-close-tail-loss               | -
 pick      | fix(runtime): forward a bulk terminal that no finish will follow        | msb-forward-reset-no-close              | -
+pick      | feat(image): add a proxy option to the registry client                  | msb-registry-proxy-option               | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
