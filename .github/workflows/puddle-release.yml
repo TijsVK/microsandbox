@@ -10,6 +10,9 @@
 #   publish only when `publish` is true.
 # * push to the puddle branch that changes this file, .github/puddle/ or the repros: build and test the
 #   newest v*-puddle.* tag reachable from the pushed commit; never publishes.
+# * workflow_call from puddle-autobump.yml with `candidate: true`: the gates for a replayed stack that
+#   exists only as bundles in the caller's `puddle-candidate` artifact (.github/puddle/use-candidate.sh);
+#   `tag` is the tag it would get. Never publishes (the caller does, after every gate passed).
 name: puddle release
 
 on:
@@ -32,6 +35,31 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      tag:
+        description: "Fork tag the candidate would get, e.g. v0.7.8-puddle.1"
+        required: true
+        type: string
+      candidate:
+        description: "Build the caller's puddle-candidate artifact instead of the tag"
+        required: false
+        default: false
+        type: boolean
+      upstream_repo:
+        description: "Repo of the upstream release (assets and the candidate's base)"
+        required: false
+        default: superradcompany/microsandbox
+        type: string
+      upstream_tag:
+        description: "Upstream release tag the candidate is based on (default: tag without -puddle.N)"
+        required: false
+        default: ""
+        type: string
+    outputs:
+      prev_tag:
+        description: "Fork release the volume check started from"
+        value: ${{ jobs.prepare.outputs.prev_tag }}
 
 permissions:
   contents: read
@@ -44,7 +72,8 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: "10"
   CARGO_INCREMENTAL: "0"
-  UPSTREAM_REPO: superradcompany/microsandbox
+  UPSTREAM_REPO: ${{ inputs.upstream_repo || 'superradcompany/microsandbox' }}
+  CANDIDATE: ${{ inputs.candidate && 'true' || 'false' }}
   RUST_TARGET: x86_64-pc-windows-msvc
 
 jobs:
@@ -56,6 +85,7 @@ jobs:
       tag: ${{ steps.tags.outputs.tag }}
       version: ${{ steps.tags.outputs.version }}
       upstream_tag: ${{ steps.tags.outputs.upstream_tag }}
+      prev_tag: ${{ steps.prev.outputs.prev_tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -66,6 +96,7 @@ jobs:
         id: tags
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_UPSTREAM_TAG: ${{ inputs.upstream_tag }}
         run: |
           set -euo pipefail
           if [ -n "$INPUT_TAG" ]; then
@@ -80,13 +111,25 @@ jobs:
             echo "::error::$TAG is not a v<MAJOR.MINOR.PATCH>-puddle.<N> tag"
             exit 1
           fi
-          upstream="${TAG%-puddle.*}"
+          upstream="${INPUT_UPSTREAM_TAG:-${TAG%-puddle.*}}"
           {
             echo "tag=$TAG"
             echo "version=${TAG#v}"
             echo "upstream_tag=$upstream"
           } >> "$GITHUB_OUTPUT"
           echo "fork tag $TAG, upstream release $upstream"
+
+      - name: Previous fork release (volume check)
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tags.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prev=$(gh release list -R "$GITHUB_REPOSITORY" --exclude-drafts --limit 50 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName | test(\"^v[0-9]+[.][0-9]+[.][0-9]+-puddle[.][0-9]+$\")) | select(.tagName != \"$TAG\")] | sort_by(.createdAt) | last | .tagName // empty")
+          echo "prev_tag=$prev" >> "$GITHUB_OUTPUT"
+          echo "previous fork release for the volume check: ${prev:-none}"
 
       - name: Download upstream libkrunfw.dll, agentd, checksums
         env:
@@ -126,14 +169,32 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
 
       # Helper scripts come from the workflow's own commit, which may be newer than the tag.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: _puddle
           sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
 
       - name: Checkout libkrunfw MSVC helpers
         shell: pwsh
@@ -228,8 +289,32 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
@@ -277,8 +362,32 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
         with:
           ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
@@ -324,15 +433,80 @@ jobs:
     with:
       msb_artifact: msb-windows-x86_64
 
+  # A workspace volume made by the previous fork release opens, reads and writes on this build.
+  volume-compat:
+    name: Volume from the previous release
+    needs: [prepare, build-windows]
+    if: needs.prepare.outputs.prev_tag != ''
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: msb-windows-x86_64
+          path: new/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: new/
+
+      - name: Previous release ${{ needs.prepare.outputs.prev_tag }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREV: ${{ needs.prepare.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$PREV" -R "$GITHUB_REPOSITORY" -D old \
+            -p checksums.sha256 -p msb-windows-x86_64.exe -p libkrunfw-windows-x86_64.dll
+          v=.github/puddle/verify-asset.sh
+          bash "$v" old/checksums.sha256 old/msb-windows-x86_64.exe msb-windows-x86_64.exe
+          bash "$v" old/checksums.sha256 old/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+
+      - name: Install layouts
+        shell: pwsh
+        run: |
+          foreach ($d in 'old', 'new') {
+            New-Item -ItemType Directory -Force -Path "rt-$d" | Out-Null
+            Copy-Item "$d\msb-windows-x86_64.exe" "rt-$d\msb.exe" -Force
+            Copy-Item "$d\libkrunfw-windows-x86_64.dll" "rt-$d\libkrunfw.dll" -Force
+            & "rt-$d\msb.exe" --version
+          }
+
+      - name: Volume made by ${{ needs.prepare.outputs.prev_tag }} opens on ${{ needs.prepare.outputs.tag }}
+        shell: pwsh
+        run: |
+          $w = Join-Path $env:RUNNER_TEMP 'vc'
+          ./tests/puddle/run-outside-job.ps1 -Script tests/puddle/volume-compat.ps1 -Log "$w-log/volume-compat.log" -TimeoutSec 1200 -- `
+            -OldMsb "$PWD\rt-old\msb.exe" -OldLibkrunfw "$PWD\rt-old\libkrunfw.dll" `
+            -NewMsb "$PWD\rt-new\msb.exe" -NewLibkrunfw "$PWD\rt-new\libkrunfw.dll" -Work $w
+          exit $LASTEXITCODE
+
   release:
     name: Publish release
-    needs: [prepare, build-windows, test-windows, test-linux, repros]
-    if: github.ref_type == 'tag' || inputs.publish
+    needs: [prepare, build-windows, test-windows, test-linux, repros, volume-compat]
+    if: >-
+      !cancelled() && !inputs.candidate && (github.ref_type == 'tag' || inputs.publish) &&
+      needs.prepare.result == 'success' && needs.build-windows.result == 'success' &&
+      needs.test-windows.result == 'success' && needs.test-linux.result == 'success' &&
+      needs.repros.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.volume-compat.result)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: upstream-assets
@@ -343,34 +517,10 @@ jobs:
           name: msb-windows-x86_64
           path: assets/
 
-      - name: Assemble assets and checksums
-        run: |
-          set -euo pipefail
-          cp upstream/libkrunfw-windows-x86_64.dll upstream/agentd-x86_64 assets/
-          cd assets
-          sha256sum msb-windows-x86_64.exe libkrunfw-windows-x86_64.dll agentd-x86_64 > checksums.sha256
-          cat checksums.sha256
-
       - name: Create release and upload
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
           UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::release $TAG already exists; not overwriting its assets"
-            exit 1
-          fi
-          {
-            echo "puddle fork of microsandbox at \`$TAG\`: upstream [\`$UPSTREAM_TAG\`](https://github.com/$UPSTREAM_REPO/releases/tag/$UPSTREAM_TAG) plus the puddle patch stack (see the commits on top of \`$UPSTREAM_TAG\`)."
-            echo
-            echo "- \`msb-windows-x86_64.exe\`: built by [this run]($RUN_URL) with MSVC, static CRT, features \`embed-binaries,net,ssh\`, embedding upstream's agentd."
-            echo "- \`libkrunfw-windows-x86_64.dll\`, \`agentd-x86_64\`: unchanged from upstream \`$UPSTREAM_TAG\`, checked against its \`checksums.sha256\`."
-            echo "- \`checksums.sha256\`: SHA-256 of the three files above."
-            echo
-            echo "Not an official microsandbox release."
-          } > notes.md
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes-file notes.md \
-            assets/msb-windows-x86_64.exe assets/libkrunfw-windows-x86_64.dll assets/agentd-x86_64 assets/checksums.sha256
+        run: bash _puddle/.github/puddle/publish-release.sh "$TAG" "$UPSTREAM_REPO" "$UPSTREAM_TAG" "$RUN_URL" assets upstream
