@@ -235,3 +235,7 @@ msb_krun_polly = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" 
 msb_krun_smbios = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
 msb_krun_utils = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
 msb_krun_vmm = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+# puddle fork: russh 0.63.3 (the version Cargo.lock resolves) plus the fix for the
+# session wedge when the peer closes a channel with queued data. One branch per
+# russh base version; move to a new `puddle-<version>` branch when the lock moves.
+russh = { git = "https://github.com/TijsVK/russh", branch = "puddle-0.63.3" }
