@@ -459,6 +459,11 @@ def replay(args, repo, work, gitconfig, report):
         elif action == "version":
             version_extra.append(c)
         elif action in ("krun", "russh"):
+            if (action == "krun" and applied_krun) or (action == "russh" and applied_russh):
+                # A later commit that moved the same leg (e.g. a new fork commit in Cargo.lock):
+                # the leg's single regenerated commit already pins the branch's current tip.
+                report["dropped"].append({"commit": subj, "why": f"folded into the regenerated {action} commit"})
+                continue
             if action == "krun":
                 applied_krun = krun
             else:

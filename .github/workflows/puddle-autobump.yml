@@ -1,7 +1,7 @@
 # puddle fork: follow upstream msb releases (puddle D-56/D-57). Fork-only file.
 #
 # Every 6 hours (and on dispatch): find the newest upstream release that is ready (published, not a
-# draft or prerelease, has checksums.sha256 and the Windows assets). Skip it when a fork tag
+# draft or prerelease, has checksums.sha256 and the assets the gates use). Skip it when a fork tag
 # v<release>-puddle.* already exists or an auto-bump PR/issue for it is open; never build an older
 # release than the fork's. Otherwise:
 #   replay   rebuild the patch stack on the release tag (.github/puddle/replay.py, manifest
@@ -106,7 +106,7 @@ jobs:
           echo "$info" | jq '{tagName, isDraft, isPrerelease, publishedAt, assets: [.assets[].name] | length}'
           [ "$(echo "$info" | jq -r .isDraft)" = false ] || skip "$rel is a draft"
           if [ "$(echo "$info" | jq -r .isPrerelease)" = true ] && [ "$ALLOW_PRE" != true ]; then skip "$rel is a prerelease"; fi
-          for a in checksums.sha256 libkrunfw-windows-x86_64.dll agentd-x86_64; do
+          for a in checksums.sha256 libkrunfw-windows-x86_64.dll agentd-x86_64 msb-linux-x86_64 libkrunfw-linux-x86_64.so; do
             echo "$info" | jq -e --arg a "$a" '.assets[] | select(.name == $a)' >/dev/null || skip "$rel has no $a yet (still building)"
           done
           x=$(echo "$rel" | sed -n 's/^.*v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p')
