@@ -169,7 +169,8 @@ jobs:
           FORCE_LEGS: ${{ inputs.force_legs && 'true' || 'false' }}
           INJECT: ${{ inputs.inject_conflict && 'true' || 'false' }}
         run: |
-          set -uo pipefail
+          # No -e (Actions' default): exit code 3 (conflict) is a result, handled below.
+          set +e -uo pipefail
           git config --global user.name "puddle auto-bump"
           git config --global user.email puddle@tijsvankampen.be
           extra=()
