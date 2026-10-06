@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // repro-client.mjs - host side. Opens TOTAL connections (PAR at a time) to a local `ssh -L`
 // port, sends one byte and resets the socket (RST) a random 0..MAX_MS ms after connecting; if
 // the guest closes first, that connection counts as "eof".
