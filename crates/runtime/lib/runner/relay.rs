@@ -175,6 +175,14 @@ const BULK_WRITE_MAX_FLOWS_PER_CLIENT: usize = 64;
 /// Maximum out-of-order records retained for one guest-to-host bulk flow.
 const BULK_MERGE_MAX_PENDING_RECORDS: usize = 1024;
 
+/// A terminal that ends a guest-to-host flow without a finish (a reset guest socket, a failed
+/// file read) carries no final offset, so the merger cannot tell which raw records still crossing
+/// the bulk lane precede it. It holds the terminal until no record of that flow has arrived for
+/// the quiet period, and never longer than the maximum hold.
+const BULK_UNFINISHED_TERMINAL_QUIET: std::time::Duration = std::time::Duration::from_millis(200);
+const BULK_UNFINISHED_TERMINAL_MAX_HOLD: std::time::Duration =
+    std::time::Duration::from_millis(750);
+
 /// Bounded window for publishing typed cancellation during a relay transport failure.
 const RELAY_FAILURE_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -441,12 +449,21 @@ struct GuestMergeFlow {
     pending_terminal: Option<LaneFrame>,
 }
 
+/// Release schedule for a terminal that no finish will ever satisfy.
+#[derive(Clone, Copy)]
+struct UnfinishedTerminalHold {
+    release_at: Instant,
+    deadline: Instant,
+}
+
 /// Cross-lane merger that reconstructs one valid outward SDK stream.
 #[derive(Default)]
 struct GuestFrameMerger {
     flows: HashMap<(ClientIncarnation, u32), GuestMergeFlow>,
     /// Compact owner-local bitmaps remember retired IDs without one allocation per operation.
     retired: HashMap<ClientIncarnation, Vec<u64>>,
+    /// Flows whose held terminal ended them without a finish.
+    unfinished: HashMap<(ClientIncarnation, u32), UnfinishedTerminalHold>,
 }
 
 /// The agent relay running in the sandbox process.
@@ -756,11 +773,14 @@ impl GuestFrameMerger {
             // The peer now owes a fresh ordinary terminal failure for the cancellation.
             flow.pending_terminal = None;
         }
+        self.unfinished.remove(&(incarnation, id));
     }
 
     /// Drop all held frames owned by one disconnected client incarnation.
     fn drop_incarnation(&mut self, incarnation: ClientIncarnation) {
         self.flows.retain(|(owner, _), _| *owner != incarnation);
+        self.unfinished
+            .retain(|(owner, _), _| *owner != incarnation);
         self.retired.remove(&incarnation);
     }
 
@@ -774,11 +794,15 @@ impl GuestFrameMerger {
 
     /// Admit one lane event and return the outward frames whose dependencies are satisfied.
     fn push(&mut self, lane_frame: LaneFrame) -> RuntimeResult<Vec<LaneFrame>> {
+        self.push_at(lane_frame, Instant::now())
+    }
+
+    fn push_at(&mut self, lane_frame: LaneFrame, now: Instant) -> RuntimeResult<Vec<LaneFrame>> {
         let incarnation = lane_frame.incarnation.ok_or_else(|| {
             RuntimeError::Custom("dual-port merge event is missing client incarnation".into())
         })?;
         if lane_frame.frame.flags == FLAG_BULK {
-            return self.push_raw(lane_frame);
+            return self.push_raw(lane_frame, now);
         }
 
         let message = decode_frame(lane_frame.frame.data.as_ref())?;
@@ -901,13 +925,26 @@ impl GuestFrameMerger {
                         message.id
                     )));
                 }
+                // agentd queues a flow's finish ahead of its terminal on this lane, so with no
+                // finish here none will follow. Waiting for one would leave the SDK operation
+                // open forever; `release_unfinished` forwards the terminal after a short drain.
+                if flow.pending_finish.is_none() {
+                    let deadline = now + BULK_UNFINISHED_TERMINAL_MAX_HOLD;
+                    self.unfinished.insert(
+                        key,
+                        UnfinishedTerminalHold {
+                            release_at: (now + BULK_UNFINISHED_TERMINAL_QUIET).min(deadline),
+                            deadline,
+                        },
+                    );
+                }
                 Ok(Vec::new())
             }
             _ => Ok(vec![lane_frame]),
         }
     }
 
-    fn push_raw(&mut self, lane_frame: LaneFrame) -> RuntimeResult<Vec<LaneFrame>> {
+    fn push_raw(&mut self, lane_frame: LaneFrame, now: Instant) -> RuntimeResult<Vec<LaneFrame>> {
         let incarnation = lane_frame.incarnation.ok_or_else(|| {
             RuntimeError::Custom("dedicated bulk record is missing client incarnation".into())
         })?;
@@ -935,6 +972,9 @@ impl GuestFrameMerger {
             return Err(RuntimeError::Custom(format!(
                 "raw record arrived after bulk finish for correlation {id}"
             )));
+        }
+        if let Some(hold) = self.unfinished.get_mut(&key) {
+            hold.release_at = (now + BULK_UNFINISHED_TERMINAL_QUIET).min(hold.deadline);
         }
         if flow
             .pending_finish
@@ -1001,6 +1041,34 @@ impl GuestFrameMerger {
         Ok(ready)
     }
 
+    /// Earliest time at which `release_unfinished` has a terminal to forward.
+    fn next_unfinished_release(&self) -> Option<Instant> {
+        self.unfinished.values().map(|hold| hold.release_at).min()
+    }
+
+    /// Forward each terminal whose drain period ended, after the records that reached the
+    /// merger in order. Records still missing then are dropped with the retired flow.
+    fn release_unfinished(&mut self, now: Instant) -> RuntimeResult<Vec<LaneFrame>> {
+        let due: Vec<_> = self
+            .unfinished
+            .iter()
+            .filter(|(_, hold)| hold.release_at <= now)
+            .map(|(key, _)| *key)
+            .collect();
+        let mut ready = Vec::new();
+        for key in due {
+            self.unfinished.remove(&key);
+            let Some(mut flow) = self.flows.remove(&key) else {
+                continue;
+            };
+            self.retire(key.0, key.1)?;
+            if let Some(terminal) = flow.pending_terminal.take() {
+                ready.push(terminal);
+            }
+        }
+        Ok(ready)
+    }
+
     fn drain_flow(
         &mut self,
         key: (ClientIncarnation, u32),
@@ -1044,6 +1112,7 @@ impl GuestFrameMerger {
         }
         if terminal_forwarded {
             self.flows.remove(&key);
+            self.unfinished.remove(&key);
             self.retire(key.0, key.1)?;
         }
         Ok(())
@@ -3589,6 +3658,7 @@ async fn ring_reader_task(
     let mut merger = GuestFrameMerger::default();
 
     let outcome = 'reader: loop {
+        let unfinished_release = merger.next_unfinished_release();
         let lane_event = tokio::select! {
             biased;
             event = control_lane_rx.recv() => {
@@ -3639,6 +3709,32 @@ async fn ring_reader_task(
                     ));
                 };
                 event
+            }
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                unfinished_release.unwrap_or_else(Instant::now),
+            )), if unfinished_release.is_some() => {
+                let frames = match merger.release_unfinished(Instant::now()) {
+                    Ok(frames) => frames,
+                    Err(error) => {
+                        break 'reader Err(RuntimeError::Custom(format!(
+                            "agent relay: cross-lane merge failed: {error}"
+                        )));
+                    }
+                };
+                for lane_frame in frames {
+                    if let Err(error) = route_guest_lane_frame(
+                        lane_frame,
+                        dual_port,
+                        &clients,
+                        log_writer.as_deref(),
+                        &session_registry,
+                    )
+                    .await
+                    {
+                        break 'reader Err(error);
+                    }
+                }
+                continue;
             }
         };
 
@@ -5296,6 +5392,7 @@ mod tests {
     };
     use microsandbox_protocol::core::Ready;
     use microsandbox_protocol::fs::FsResponse;
+    use microsandbox_protocol::tcp::TcpClosed;
     use microsandbox_protocol::transport::{
         BulkTransportReady, RelayLeaseReady, decode_bulk_ack, encode_bulk_hello,
     };
@@ -6494,6 +6591,212 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(terminal.len(), 1);
+        assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
+    }
+
+    fn accepted_tcp_merger(id: u32, budget: &Arc<Semaphore>) -> GuestFrameMerger {
+        let mut merger = GuestFrameMerger::default();
+        merger.register(TEST_INCARNATION, id).unwrap();
+        merger
+            .push(lane_frame(
+                encoded_message_id(
+                    MessageType::BulkAccepted,
+                    id,
+                    &BulkAccepted {
+                        kind: BulkKind::Tcp,
+                        ..bulk_accepted()
+                    },
+                ),
+                budget,
+            ))
+            .unwrap();
+        merger
+    }
+
+    fn tcp_reset_terminal(id: u32, budget: &Arc<Semaphore>) -> LaneFrame {
+        lane_frame(
+            encoded_message_id(
+                MessageType::TcpFailed,
+                id,
+                &TcpFailed {
+                    error: "read TCP stream: Connection reset by peer (os error 104)".into(),
+                },
+            ),
+            budget,
+        )
+    }
+
+    #[test]
+    fn guest_merger_releases_terminal_without_finish_after_records_drain() {
+        let id = 75;
+        let budget = Arc::new(Semaphore::new(64 * 1024));
+        let full_budget = budget.available_permits();
+        let mut merger = accepted_tcp_merger(id, &budget);
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+
+        assert_eq!(
+            merger
+                .push_at(lane_frame(encoded_raw(id, 0, b"abc"), &budget), at(0))
+                .unwrap()
+                .len(),
+            1
+        );
+        // The guest socket was reset mid-download: agentd's read failed, so it sent the failure
+        // terminal and no finish. Records it sent before that may still be crossing the bulk lane.
+        assert!(
+            merger
+                .push_at(tcp_reset_terminal(id, &budget), at(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            merger.next_unfinished_release(),
+            Some(at(0) + BULK_UNFINISHED_TERMINAL_QUIET)
+        );
+
+        // A trailing record still reaches the SDK ahead of the terminal and restarts the drain.
+        assert_eq!(
+            merger
+                .push_at(lane_frame(encoded_raw(id, 3, b"def"), &budget), at(100))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            merger.next_unfinished_release(),
+            Some(at(100) + BULK_UNFINISHED_TERMINAL_QUIET)
+        );
+        assert!(merger.release_unfinished(at(250)).unwrap().is_empty());
+        assert!(
+            merger
+                .push_at(lane_frame(encoded_raw(id, 10, b"gap"), &budget), at(250))
+                .unwrap()
+                .is_empty()
+        );
+
+        let ready = merger
+            .release_unfinished(at(250) + BULK_UNFINISHED_TERMINAL_QUIET)
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            decode_frame(ready[0].frame.data.as_ref()).unwrap().t,
+            MessageType::TcpFailed
+        );
+        drop(ready);
+        assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
+        assert_eq!(merger.next_unfinished_release(), None);
+        assert_eq!(budget.available_permits(), full_budget);
+
+        // Frames after the release belong to a retired operation, including the terminal of an
+        // SDK cancel that crossed the failure.
+        assert!(
+            merger
+                .push(lane_frame(encoded_raw(id, 6, b"ghi"), &budget))
+                .unwrap()
+                .is_empty()
+        );
+        merger.drop_flow(TEST_INCARNATION, id);
+        assert!(
+            merger
+                .push(tcp_reset_terminal(id, &budget))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(budget.available_permits(), full_budget);
+    }
+
+    #[test]
+    fn guest_merger_bounds_the_hold_of_a_terminal_without_finish() {
+        let id = 77;
+        let budget = Arc::new(Semaphore::new(64 * 1024));
+        let mut merger = accepted_tcp_merger(id, &budget);
+        let start = Instant::now();
+        assert!(
+            merger
+                .push_at(tcp_reset_terminal(id, &budget), start)
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut offset = 0;
+        let mut now = start;
+        while now + BULK_UNFINISHED_TERMINAL_QUIET / 2 < start + BULK_UNFINISHED_TERMINAL_MAX_HOLD {
+            now += BULK_UNFINISHED_TERMINAL_QUIET / 2;
+            merger
+                .push_at(lane_frame(encoded_raw(id, offset, b"abc"), &budget), now)
+                .unwrap();
+            offset += 3;
+        }
+        assert_eq!(
+            merger.next_unfinished_release(),
+            Some(start + BULK_UNFINISHED_TERMINAL_MAX_HOLD)
+        );
+        let ready = merger
+            .release_unfinished(start + BULK_UNFINISHED_TERMINAL_MAX_HOLD)
+            .unwrap();
+        assert_eq!(ready.len(), 1);
+        assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
+    }
+
+    #[test]
+    fn guest_merger_cancel_clears_the_hold_of_a_terminal_without_finish() {
+        let id = 79;
+        let budget = Arc::new(Semaphore::new(64 * 1024));
+        let mut merger = accepted_tcp_merger(id, &budget);
+        merger.push(tcp_reset_terminal(id, &budget)).unwrap();
+        assert!(merger.next_unfinished_release().is_some());
+
+        merger.drop_flow(TEST_INCARNATION, id);
+        assert_eq!(merger.next_unfinished_release(), None);
+        assert_eq!(
+            merger.push(tcp_reset_terminal(id, &budget)).unwrap().len(),
+            1
+        );
+        assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
+    }
+
+    #[test]
+    fn guest_merger_holds_terminal_behind_its_pending_finish() {
+        let id = 81;
+        let budget = Arc::new(Semaphore::new(64 * 1024));
+        let mut merger = accepted_tcp_merger(id, &budget);
+        let finish = BulkFinish {
+            kind: BulkKind::Tcp,
+            flow: BulkFlow::GuestToHost,
+            final_offset: 3,
+        };
+        assert!(
+            merger
+                .push(lane_frame(
+                    encoded_message_id(MessageType::BulkFinish, id, &finish),
+                    &budget,
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            merger
+                .push(lane_frame(
+                    encoded_message_id(MessageType::TcpClosed, id, &TcpClosed {}),
+                    &budget,
+                ))
+                .unwrap()
+                .is_empty()
+        );
+        // A finish names the final offset, so the terminal waits for it without a deadline.
+        assert_eq!(merger.next_unfinished_release(), None);
+
+        let ready = merger
+            .push(lane_frame(encoded_raw(id, 0, b"abc"), &budget))
+            .unwrap();
+        let types: Vec<_> = ready
+            .iter()
+            .skip(1)
+            .map(|frame| decode_frame(frame.frame.data.as_ref()).unwrap().t)
+            .collect();
+        assert_eq!(ready.len(), 3);
+        assert_eq!(types, [MessageType::BulkFinish, MessageType::TcpClosed]);
         assert!(!merger.flows.contains_key(&(TEST_INCARNATION, id)));
     }
 
