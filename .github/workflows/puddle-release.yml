@@ -403,18 +403,37 @@ jobs:
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
 
-      # The default features embed agentd: take upstream's verified one, as the Windows build does,
-      # instead of a download keyed on the crate version (which a simulated release doesn't have).
+      # The default features take agentd (filesystem crate) and the msb + libkrunfw pair (SDK) from
+      # MSB_EMBED_ARTIFACTS_DIR when it is set, else download them by crate version (which a
+      # simulated release doesn't have). Stage upstream's verified files: agentd as the Windows build
+      # does, plus the Linux pair, because the SDK requires both once the variable is set.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: upstream-assets
           path: ${{ runner.temp }}/upstream
 
-      - name: Stage upstream agentd for embedding
+      - name: Stage upstream agentd, msb and libkrunfw (Linux) for the build scripts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
         run: |
-          mkdir -p "$RUNNER_TEMP/embed"
-          cp "$RUNNER_TEMP/upstream/agentd-x86_64" "$RUNNER_TEMP/embed/agentd"
-          echo "MSB_EMBED_ARTIFACTS_DIR=$RUNNER_TEMP/embed" >> "$GITHUB_ENV"
+          set -euo pipefail
+          up="$RUNNER_TEMP/upstream"
+          e="$RUNNER_TEMP/embed"
+          mkdir -p "$e" "$RUNNER_TEMP/linux"
+          gh release download "$UPSTREAM_TAG" -R "$UPSTREAM_REPO" -D "$RUNNER_TEMP/linux" \
+            -p msb-linux-x86_64 -p libkrunfw-linux-x86_64.so
+          v=_puddle/.github/puddle/verify-asset.sh
+          bash "$v" "$up/checksums.sha256" "$up/agentd-x86_64" agentd-x86_64
+          bash "$v" "$up/checksums.sha256" "$RUNNER_TEMP/linux/msb-linux-x86_64" msb-linux-x86_64
+          bash "$v" "$up/checksums.sha256" "$RUNNER_TEMP/linux/libkrunfw-linux-x86_64.so" libkrunfw-linux-x86_64.so
+          krunfw=$(sed -n 's/^pub const LIBKRUNFW_VERSION: &str = "\(.*\)";$/\1/p' crates/utils/lib/lib.rs)
+          [ -n "$krunfw" ] || { echo "::error::LIBKRUNFW_VERSION not found in crates/utils/lib/lib.rs"; exit 1; }
+          cp "$up/agentd-x86_64" "$e/agentd"
+          install -m 755 "$RUNNER_TEMP/linux/msb-linux-x86_64" "$e/msb"
+          cp "$RUNNER_TEMP/linux/libkrunfw-linux-x86_64.so" "$e/libkrunfw.so.$krunfw"
+          ls -l "$e"
+          echo "MSB_EMBED_ARTIFACTS_DIR=$e" >> "$GITHUB_ENV"
 
       # relay crash fix (runtime), stale dir + ssh fixes (SDK), ssh fixes (CLI).
       - name: msb lib tests
