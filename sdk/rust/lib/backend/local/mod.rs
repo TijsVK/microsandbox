@@ -78,6 +78,7 @@ pub struct LocalBackend {
     control_sessions: control::ControlSessions,
     metrics_lookup: metrics_lookup::MetricsLookup,
     pub(crate) metrics_registry_names: Vec<String>,
+    registry_proxy: Option<String>,
 }
 
 /// Fluent builder for [`LocalBackend`]. Construct via [`LocalBackend::builder`].
@@ -95,6 +96,7 @@ pub struct LocalBackendBuilder {
     config: GlobalConfigPatch,
     config_path: Option<PathBuf>,
     managed_config_path: Option<PathBuf>,
+    registry_proxy: Option<String>,
 }
 
 struct MigrationLock {
@@ -142,6 +144,7 @@ impl LocalBackend {
             control_sessions: control::ControlSessions::default(),
             metrics_lookup: metrics_lookup::MetricsLookup::default(),
             metrics_registry_names,
+            registry_proxy: None,
         }
     }
 
@@ -196,13 +199,21 @@ impl LocalBackend {
         hostname: &str,
         options: RegistryOptions,
     ) -> MicrosandboxResult<RegistryConfig> {
-        self.config
+        let mut config = self
+            .config
             .registry_layers(hostname)
             .options(RegistrySettingsPatch::from_options(options))
             .build()
             .into_config()
             .resolve(hostname, self.config())
-            .await
+            .await?;
+        config.proxy.clone_from(&self.registry_proxy);
+        Ok(config)
+    }
+
+    /// The proxy for registry requests, if one was set on the builder.
+    pub(crate) fn registry_proxy(&self) -> Option<&str> {
+        self.registry_proxy.as_deref()
     }
 
     /// Clone the backend-owned config handle for APIs that need to return the
@@ -438,6 +449,18 @@ impl LocalBackendBuilder {
         self
     }
 
+    /// Send this backend's image pulls through a proxy.
+    ///
+    /// The URL may carry credentials (`http://user:token@127.0.0.1:3128`). It applies to every
+    /// registry client the backend builds (`create`, snapshot restore) and is returned by
+    /// [`LocalBackend::registry_config`] for callers that build their own `Registry`, and replaces the process environment
+    /// for those requests, so nothing needs to export `HTTPS_PROXY`. It lives in memory only:
+    /// it is never read from or written to `config.json`.
+    pub fn registry_proxy(mut self, url: impl Into<String>) -> Self {
+        self.registry_proxy = Some(url.into());
+        self
+    }
+
     /// Override the default SSH inactivity timeout in seconds.
     ///
     /// Pass `0` to disable the timeout.
@@ -483,11 +506,10 @@ impl LocalBackendBuilder {
         let config = BackendConfig::load_from(&path, self.managed_config_path.as_deref())?
             .prepare_for_local_backend(self.config)?;
 
-        Ok(LocalBackend::from_backend_config(
-            config,
-            BackendSelectionSource::Programmatic,
-            None,
-        ))
+        let mut backend =
+            LocalBackend::from_backend_config(config, BackendSelectionSource::Programmatic, None);
+        backend.registry_proxy = self.registry_proxy;
+        Ok(backend)
     }
 }
 
@@ -789,6 +811,41 @@ mod tests {
             BackendSelectionSource::Programmatic,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn registry_config_carries_the_builders_proxy_and_the_default_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.json");
+        let without = LocalBackend::builder()
+            .config_path(&config)
+            .home(tmp.path())
+            .build_lazy()
+            .unwrap();
+        let resolved = without
+            .registry_config("registry.example", RegistryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.proxy, None);
+
+        let with = LocalBackend::builder()
+            .config_path(&config)
+            .home(tmp.path())
+            .registry_proxy("http://puddle:tok@127.0.0.1:3128")
+            .build_lazy()
+            .unwrap();
+        let resolved = with
+            .registry_config("registry.example", RegistryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.proxy.as_deref(),
+            Some("http://puddle:tok@127.0.0.1:3128")
+        );
+        assert!(
+            !config.exists(),
+            "the proxy is in memory only, never written to config.json"
+        );
     }
 
     #[tokio::test]
