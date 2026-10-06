@@ -8,11 +8,17 @@
 # * push of a tag v*-puddle.* whose commit contains this file: build, test, publish.
 # * workflow_dispatch with a tag (for tags made before this file existed): build and test;
 #   publish only when `publish` is true.
+# * push to the puddle branch that changes this file or .github/puddle/: build and test the
+#   newest v*-puddle.* tag reachable from the pushed commit; never publishes.
 name: puddle release
 
 on:
   push:
     tags: ["v*-puddle.*"]
+    branches: [puddle]
+    paths:
+      - .github/workflows/puddle-release.yml
+      - .github/puddle/**
   workflow_dispatch:
     inputs:
       tag:
@@ -29,7 +35,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: puddle-release-${{ inputs.tag || github.ref_name }}
+  group: puddle-release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -49,12 +55,25 @@ jobs:
       version: ${{ steps.tags.outputs.version }}
       upstream_tag: ${{ steps.tags.outputs.upstream_tag }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
       - name: Resolve tags
         id: tags
         env:
-          TAG: ${{ inputs.tag || github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            TAG=$INPUT_TAG
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            TAG=$GITHUB_REF_NAME
+          else
+            TAG=$(git describe --tags --match 'v*-puddle.*' --abbrev=0 HEAD)
+            echo "branch push: checking the newest reachable fork tag $TAG (no publish)"
+          fi
           if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-puddle\.[1-9][0-9]*$ ]]; then
             echo "::error::$TAG is not a v<MAJOR.MINOR.PATCH>-puddle.<N> tag"
             exit 1
@@ -66,10 +85,6 @@ jobs:
             echo "upstream_tag=$upstream"
           } >> "$GITHUB_OUTPUT"
           echo "fork tag $TAG, upstream release $upstream"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          sparse-checkout: .github/puddle
 
       - name: Download upstream libkrunfw.dll, agentd, checksums
         env:
@@ -299,7 +314,7 @@ jobs:
   release:
     name: Publish release
     needs: [prepare, build-windows, test-windows, test-linux]
-    if: github.event_name == 'push' || inputs.publish
+    if: github.ref_type == 'tag' || inputs.publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
