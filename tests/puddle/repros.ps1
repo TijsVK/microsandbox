@@ -3,7 +3,7 @@
 #
 # Each case is the repro from puddle's upstream-issues/msb-* folder turned into a pass/fail test.
 # A case PASSES when msb behaves as fixed and FAILS (with the evidence lines) when the bug shows.
-# Stock msb v0.7.7 fails all five; v0.7.7-puddle.2 and later fork tags pass.
+# Stock msb v0.7.7 fails all six; v0.7.7-puddle.2 passes the first five, v0.7.7-puddle.3 and later all six.
 #
 #   relay      closing ssh -L channels while the guest closes the same TCP connections must not
 #              stop the VM ("cross-lane merge failed: bulk finish arrived before acceptance").
@@ -14,6 +14,9 @@
 #              "administratively prohibited" (6e2530c0).
 #   stale-dir  a create rejected before the sandbox row (named volume kind mismatch) must leave no
 #              sandboxes\<name> directory, so the same name can be created again (0ad1ef63).
+#   wedge      ssh -L connections reset right after the guest starts streaming must not wedge the
+#              ssh session: no connection stalls > 5 s or hangs (russh peer-close fix, c93a7d8f;
+#              puddle upstream-issues/russh-peer-close-pending-data-wedge, T-082 "rstdata").
 #
 # Windows PowerShell 5.1 safe (ASCII only). Needs Windows OpenSSH, node 18+ (relay only) and
 # network for alpine and python:3.12-alpine. Uses its own MSB_HOME under -Work.
@@ -22,7 +25,7 @@
 #
 # usage:
 #   powershell -ExecutionPolicy Bypass -File repros.ps1 -Msb <msb.exe> [-Libkrunfw <libkrunfw.dll>]
-#       [-Case relay,signal,scp,forward,stale-dir] [-Work <dir>] [-Prefix pr] [-Rounds 10]
+#       [-Case relay,signal,scp,forward,stale-dir,wedge] [-Work <dir>] [-Prefix pr] [-Rounds 10]
 #       [-Node node] [-OpenSsh <dir with ssh.exe, scp.exe, ssh-keygen.exe>] [-LocalPort 18190]
 # Exit code: 0 when every case passed, 1 when one failed, 2 on bad usage.
 # Nothing is deleted: the script prints the work dir to remove when done.
@@ -30,7 +33,7 @@
 param(
     [Parameter(Mandatory = $true)] [string]$Msb,
     [string]$Libkrunfw = '',
-    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir'),
+    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge'),
     [string]$Work = '',
     [string]$Prefix = 'pr',
     [int]$Rounds = 10,
@@ -43,7 +46,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir')
+$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge')
 # -Case a,b arrives as one string when the script is started with -File.
 $Case = @($Case | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 foreach ($c in $Case) {
@@ -323,6 +326,54 @@ function Test-StaleDir {
     Pass 'stale-dir' 'no leftover directory, retry create exit 0'
 }
 
+function Test-Wedge {
+    $name = $Prefix + '-wedge'
+    $port = $LocalPort + 1
+    Write-Output ('=== wedge: 300 connections x 32 parallel, reset after the first data, one ssh -L session')
+    if (-not $NodeExe) { Fail 'wedge' ('node not found: ' + $Node); return }
+    $guestDir = Join-Path $Work 'wedge-guest'
+    New-Item -ItemType Directory -Force -Path $guestDir | Out-Null
+    $py = [System.IO.File]::ReadAllText((Join-Path $Here 'guest-server.py'))
+    [System.IO.File]::WriteAllText((Join-Path $guestDir 'guest-server.py'), ($py -replace "`r`n", "`n"))
+    $r = Invoke-Msb @('create', '--name', $name, '--replace', '--cpus', '2', '--memory', '1024',
+        '--mount-dir', (Q ($guestDir + ':/opt/repro:ro')), 'python:3.12-alpine')
+    Show ('msb create ' + $name) $r
+    if ($r.Code -ne 0) { Fail 'wedge' 'precondition: create failed'; return }
+    $r = Invoke-Msb @('exec', '--no-tty', '--no-stdin', $name, '--', 'sh', '-c',
+        (Q ('nohup python3 /opt/repro/guest-server.py 18090 ' + $MaxMs + ' >/tmp/srv.log 2>&1 &')))
+    Show 'guest server start' $r
+    Initialize-Key
+    $cfg = New-SshConfig $name
+    $ssh = Start-Process -FilePath (Join-Path $OpenSsh 'ssh.exe') -WindowStyle Hidden -PassThru `
+        -RedirectStandardError (Join-Path $LogDir 'wedge-ssh-L.log') `
+        -RedirectStandardOutput (Join-Path $OutDir 'wedge-ssh-L.out') `
+        -ArgumentList @('-F', (Q $cfg), '-N', '-o', 'ExitOnForwardFailure=yes',
+            '-L', ('127.0.0.1:' + $port + ':127.0.0.1:18090'), $name)
+    Start-Sleep -Seconds 3
+    $verdict = $null
+    $line = ''
+    try {
+        if ($ssh.HasExited) {
+            Get-Content -Path (Join-Path $LogDir 'wedge-ssh-L.log') | ForEach-Object { Write-Output ('  ssh -L: ' + $_) }
+            $verdict = 'precondition: ssh -L exited at start'
+        } else {
+            $c = @(& $NodeExe (Join-Path $Here 'wedge-client.mjs') $port 300 32 $MaxMs 30 2>&1)
+            $c | ForEach-Object { Write-Output ('  ' + $_) }
+            $line = [string]$c[0]
+        }
+    } finally {
+        if ($ssh -and -not $ssh.HasExited) { Stop-Process -Id $ssh.Id -Force }
+    }
+    Remove-Sandbox $name
+    if ($verdict) { Fail 'wedge' $verdict; return }
+    if ($line -notmatch 'hung=(\d+) STALLED=(\d+) data=(\d+)') { Fail 'wedge' ('no summary line from the client: ' + $line); return }
+    $hung = [int]$Matches[1]; $stalled = [int]$Matches[2]; $data = [int]$Matches[3]
+    # Guard against a vacuous pass: connections must have received data before being reset.
+    if ($data -lt 100) { Fail 'wedge' ('precondition: only ' + $data + ' of 300 connections got data'); return }
+    if ($hung -gt 0 -or $stalled -gt 0) { Fail 'wedge' ('session wedged: hung=' + $hung + ' STALLED=' + $stalled); return }
+    Pass 'wedge' ('300 connections, hung=0 STALLED=0, data=' + $data)
+}
+
 # ------------------------------------------------------------------------------------------- main
 Write-Output ('msb: ' + $Msb)
 Show 'msb --version' (Invoke-Msb @('--version'))
@@ -336,6 +387,7 @@ foreach ($c in $Case) {
         'scp' { Test-Scp }
         'forward' { Test-Forward }
         'stale-dir' { Test-StaleDir }
+        'wedge' { Test-Wedge }
     }
     Write-Output ('  (' + $c + ' took ' + [int]$t.Elapsed.TotalSeconds + ' s)')
 }

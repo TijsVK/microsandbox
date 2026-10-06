@@ -1,7 +1,7 @@
 # puddle fork: regression repros for the fork's msb fixes, one job per case, on windows-2025.
 #
 # Fork-only file. The cases live in tests/puddle/repros.ps1 (relay crash, ssh signal exit, scp
-# exit, forward reason, stale dir on a rejected create). Each passes when msb behaves as fixed.
+# exit, forward reason, stale dir on a rejected create, russh session wedge). Each passes when msb behaves as fixed.
 #
 # * workflow_call from puddle-release.yml: tests the msb.exe that run just built (artifact
 #   `msb-windows-x86_64`) with upstream's libkrunfw (artifact `upstream-assets`); gates publishing.
@@ -31,7 +31,7 @@ on:
       cases:
         description: "Comma-separated cases (default all)"
         required: false
-        default: "relay,signal,scp,forward,stale-dir"
+        default: "relay,signal,scp,forward,stale-dir,wedge"
         type: string
 
 permissions:
@@ -45,13 +45,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [relay, signal, scp, forward, stale-dir]
+        case: [relay, signal, scp, forward, stale-dir, wedge]
     steps:
       - name: Skip cases not asked for
         id: want
         shell: pwsh
         env:
-          CASES: ${{ inputs.cases || 'relay,signal,scp,forward,stale-dir' }}
+          CASES: ${{ inputs.cases || 'relay,signal,scp,forward,stale-dir,wedge' }}
         run: |
           $want = ($env:CASES -split ',' | ForEach-Object { $_.Trim() }) -contains '${{ matrix.case }}'
           "run=$($want.ToString().ToLower())" >> $env:GITHUB_OUTPUT
