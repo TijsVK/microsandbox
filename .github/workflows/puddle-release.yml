@@ -8,7 +8,7 @@
 # * push of a tag v*-puddle.* whose commit contains this file: build, test, publish.
 # * workflow_dispatch with a tag (for tags made before this file existed): build and test;
 #   publish only when `publish` is true.
-# * push to the puddle branch that changes this file or .github/puddle/: build and test the
+# * push to the puddle branch that changes this file, .github/puddle/ or the repros: build and test the
 #   newest v*-puddle.* tag reachable from the pushed commit; never publishes.
 name: puddle release
 
@@ -19,6 +19,8 @@ on:
     paths:
       - .github/workflows/puddle-release.yml
       - .github/puddle/**
+      - .github/workflows/puddle-repros.yml
+      - tests/puddle/**
   workflow_dispatch:
     inputs:
       tag:
@@ -314,9 +316,17 @@ jobs:
         working-directory: libkrun
         run: cargo test --locked -p msb_krun_devices 'virtio::'
 
+  # Regression repros (tests/puddle/repros.ps1) against the msb.exe built above; gate publishing.
+  repros:
+    name: Regression repros
+    needs: [prepare, build-windows]
+    uses: ./.github/workflows/puddle-repros.yml
+    with:
+      msb_artifact: msb-windows-x86_64
+
   release:
     name: Publish release
-    needs: [prepare, build-windows, test-windows, test-linux]
+    needs: [prepare, build-windows, test-windows, test-linux, repros]
     if: github.ref_type == 'tag' || inputs.publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
