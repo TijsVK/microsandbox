@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # guest-server.py - runs inside the sandbox. For every connection: wait for one byte (or EOF),
 # stream data for a random 0..MAX_MS milliseconds, then close. The guest-side EOF makes agentd queue a TCP
 # BulkFinish at a moment that races the host client's own reset (repro-client.mjs).

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # run-outside-job.ps1 - run a PowerShell script outside the Actions step's job object (fork-only file).
 #
 # msb create/start launch the VM runtime with CREATE_BREAKAWAY_FROM_JOB, and a hosted runner's

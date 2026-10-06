@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # repros.ps1 - regression tests for the puddle fork's msb fixes (fork-only file).
 #
 # Each case is the repro from puddle's upstream-issues/msb-* folder turned into a pass/fail test.
@@ -120,9 +121,9 @@ function Initialize-Key {
 }
 
 function New-SshConfig {
-    # ssh_config for host $Name through "msb ssh serve --stdio"; returns its path.
+    # ssh_config for host $Name through "msb ssh serve --stdio"; returns its path and prints
+    # nothing (anything printed would become part of the return value). Call Initialize-Key first.
     param([string]$Name, [string]$LogLevel = 'ERROR')
-    Initialize-Key
     $wrapper = Join-Path $Work ($Name + '-msb-ssh.cmd')
     Set-Content -Encoding Ascii -Path $wrapper -Value @(
         '@echo off',
@@ -147,11 +148,13 @@ function New-SshConfig {
 }
 
 function New-AlpineSandbox {
-    # Returns $true when the sandbox is up; prints the create output either way.
+    # Creates the sandbox and authorizes the ssh key; prints both. Returns nothing: callers check
+    # $script:CreateOk (a return value would be mixed with the printed lines).
     param([string]$Name)
     $r = Invoke-Msb @('create', 'alpine', '--name', $Name, '--replace')
     Show ('msb create ' + $Name) $r
-    return ($r.Code -eq 0)
+    $script:CreateOk = ($r.Code -eq 0)
+    Initialize-Key
 }
 
 # ------------------------------------------------------------------------------------------ cases
@@ -171,6 +174,7 @@ function Test-Relay {
     $r = Invoke-Msb @('exec', '--no-tty', '--no-stdin', $name, '--', 'sh', '-c',
         (Q ('nohup python3 /opt/repro/guest-server.py 18090 ' + $MaxMs + ' >/tmp/srv.log 2>&1 &')))
     Show 'guest server start' $r
+    Initialize-Key
     $cfg = New-SshConfig $name
     $runtimeLog = Join-Path $MsbHome ('sandboxes\' + $name + '\logs\runtime.log')
     $resets = 0
@@ -185,7 +189,11 @@ function Test-Relay {
                 -ArgumentList @('-F', (Q $cfg), '-N', '-o', 'ExitOnForwardFailure=yes',
                     '-L', ('127.0.0.1:' + $LocalPort + ':127.0.0.1:18090'), $name)
             Start-Sleep -Seconds 3
-            if ($ssh.HasExited) { $verdict = 'precondition: ssh -L exited at start of round ' + $round; break }
+            if ($ssh.HasExited) {
+                Get-Content -Path (Join-Path $LogDir ('relay-ssh-L-' + $round + '.log')) | ForEach-Object { Write-Output ('  ssh -L: ' + $_) }
+                $verdict = 'precondition: ssh -L exited at start of round ' + $round
+                break
+            }
             $c = & $NodeExe (Join-Path $Here 'repro-client.mjs') $LocalPort $Total $Par $MaxMs 2>&1
             Start-Sleep -Seconds 2
             $sshNote = 'ssh -L alive'
@@ -220,7 +228,8 @@ function Test-Relay {
 function Test-Signal {
     $name = $Prefix + '-signal'
     Write-Output '=== signal: ssh "kill -9 $$" must not exit 0'
-    if (-not (New-AlpineSandbox $name)) { Fail 'signal' 'precondition: create failed'; return }
+    New-AlpineSandbox $name
+    if (-not $script:CreateOk) { Fail 'signal' 'precondition: create failed'; return }
     $cfg = New-SshConfig $name
     $ssh = Join-Path $OpenSsh 'ssh.exe'
     $control = Invoke-Native $ssh @('-F', (Q $cfg), $name, (Q 'exit 7'))
@@ -243,7 +252,8 @@ function Test-Signal {
 function Test-Scp {
     $name = $Prefix + '-scp'
     Write-Output '=== scp: scp -s upload and download must exit 0'
-    if (-not (New-AlpineSandbox $name)) { Fail 'scp' 'precondition: create failed'; return }
+    New-AlpineSandbox $name
+    if (-not $script:CreateOk) { Fail 'scp' 'precondition: create failed'; return }
     $cfg = New-SshConfig $name
     $scp = Join-Path $OpenSsh 'scp.exe'
     $up = Join-Path $Work 'scp-upload.txt'
@@ -268,7 +278,8 @@ function Test-Scp {
 function Test-Forward {
     $name = $Prefix + '-forward'
     Write-Output '=== forward: refused forwards must say "connect failed"'
-    if (-not (New-AlpineSandbox $name)) { Fail 'forward' 'precondition: create failed'; return }
+    New-AlpineSandbox $name
+    if (-not $script:CreateOk) { Fail 'forward' 'precondition: create failed'; return }
     $cfg = New-SshConfig $name 'INFO'
     $ssh = Join-Path $OpenSsh 'ssh.exe'
     $a = Invoke-Native $ssh @('-F', (Q $cfg), '-W', '127.0.0.1:18081', $name) 120
