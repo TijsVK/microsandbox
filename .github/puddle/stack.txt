@@ -1,0 +1,28 @@
+# puddle fork patch stack: how .github/puddle/replay.py rebuilds the `puddle` branch on a new
+# upstream release (fork-only file). Every commit on `puddle` since its upstream base must match one
+# rule; an unmatched commit stops the replay, so a new fix gets a line here when it lands.
+#
+# Columns, separated by " | ":
+#   action    pick     cherry-pick the commit; dropped when it comes out empty (upstream has it)
+#             krun     regenerate: msb_krun pin + [patch.crates-io] to TijsVK/libkrun (libkrun leg)
+#             russh    regenerate: [patch.crates-io] russh to TijsVK/russh (russh leg)
+#             version  regenerate as the last commit: workspace version and `=` pins become
+#                      <release>-puddle.N; the commit's other files (not Cargo.*) are kept
+#             rm:PATH  delete PATH again on the new base (commit message kept)
+#   match     the commit subject; a trailing * matches a prefix. First matching line wins.
+#   folder    puddle's upstream-issues/ folder (the D-45 filing list), or -
+#   upstream  owner/repo#N of the upstream PR once filed, or -. A merged PR whose merge commit is
+#             in the new release drops the commit.
+#
+# action  | match                                                                   | folder                                  | upstream
+krun      | build: use the puddle libkrun fork*                                     | -                                       | -
+pick      | fix(runtime): drop a late bulk finish for a retired flow                | msb-relay-cross-lane-merge              | -
+pick      | fix(ssh): report refused forwards as connect failed                     | msb-ssh-forward-connect-failed          | -
+pick      | fix(ssh): report SFTP exit status so scp exits 0                        | msb-ssh-sftp-exit-status                | -
+pick      | fix(ssh): don't report signal-killed commands as success                | msb-ssh-signal-exit-status              | -
+pick      | fix(sandbox): remove storage of a rejected create                       | msb-stale-dir-on-failed-create          | -
+pick      | fix(vsock): write queued guest bytes before closing a named-pipe route  | msb-vsock-close-tail-loss               | -
+version   | build: version the puddle fork as*                                      | -                                       | -
+rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
+pick      | ci(puddle):*                                                            | -                                       | -
+russh     | build: use the puddle russh fork*                                       | russh-peer-close-pending-data-wedge     | -
