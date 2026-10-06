@@ -3,7 +3,8 @@
 #
 # Each case is the repro from puddle's upstream-issues/msb-* folder turned into a pass/fail test.
 # A case PASSES when msb behaves as fixed and FAILS (with the evidence lines) when the bug shows.
-# Stock msb v0.7.7 fails all six; v0.7.7-puddle.2 passes the first five, v0.7.7-puddle.3 and later all six.
+# Stock msb v0.7.7 fails all seven; v0.7.7-puddle.2 passes the first five, v0.7.7-puddle.3 the first
+# six, v0.7.7-puddle.4 and later all seven.
 #
 #   relay      closing ssh -L channels while the guest closes the same TCP connections must not
 #              stop the VM ("cross-lane merge failed: bulk finish arrived before acceptance").
@@ -17,6 +18,10 @@
 #   wedge      ssh -L connections reset right after the guest starts streaming must not wedge the
 #              ssh session: no connection stalls > 5 s or hangs (russh peer-close fix, c93a7d8f;
 #              puddle upstream-issues/russh-peer-close-pending-data-wedge, T-082 "rstdata").
+#   boot       -BootRounds rounds of -BootPar concurrent creates must all boot. Under host load the
+#              guest's IO-APIC timer check lost PIT ticks and panicked, so the VM exited 0 before
+#              the agent relay was up (libkrun fork bdf711f0, no_timer_check on WHP; puddle
+#              upstream-issues/msb-windows-boot-race).
 #
 # Windows PowerShell 5.1 safe (ASCII only). Needs Windows OpenSSH, node 18+ (relay only) and
 # network for alpine and python:3.12-alpine. Uses its own MSB_HOME under -Work.
@@ -25,7 +30,8 @@
 #
 # usage:
 #   powershell -ExecutionPolicy Bypass -File repros.ps1 -Msb <msb.exe> [-Libkrunfw <libkrunfw.dll>]
-#       [-Case relay,signal,scp,forward,stale-dir,wedge] [-Work <dir>] [-Prefix pr] [-Rounds 10]
+#       [-Case relay,signal,scp,forward,stale-dir,wedge,boot] [-Work <dir>] [-Prefix pr] [-Rounds 10]
+#       [-BootRounds 10] [-BootPar 6]
 #       [-Node node] [-OpenSsh <dir with ssh.exe, scp.exe, ssh-keygen.exe>] [-LocalPort 18190]
 # Exit code: 0 when every case passed, 1 when one failed, 2 on bad usage.
 # Nothing is deleted: the script prints the work dir to remove when done.
@@ -33,7 +39,7 @@
 param(
     [Parameter(Mandatory = $true)] [string]$Msb,
     [string]$Libkrunfw = '',
-    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge'),
+    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot'),
     [string]$Work = '',
     [string]$Prefix = 'pr',
     [int]$Rounds = 10,
@@ -41,12 +47,14 @@ param(
     [int]$Par = 32,
     [int]$MaxMs = 20,
     [int]$LocalPort = 18190,
+    [int]$BootRounds = 10,
+    [int]$BootPar = 6,
     [string]$Node = 'node',
     [string]$OpenSsh = (Join-Path $env:SystemRoot 'System32\OpenSSH')
 )
 
 $ErrorActionPreference = 'Continue'
-$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge')
+$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot')
 # -Case a,b arrives as one string when the script is started with -File.
 $Case = @($Case | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 foreach ($c in $Case) {
@@ -374,6 +382,55 @@ function Test-Wedge {
     Pass 'wedge' ('300 connections, hung=0 STALLED=0, data=' + $data)
 }
 
+function Test-Boot {
+    $n = $BootRounds * $BootPar
+    Write-Output ('=== boot: ' + $BootRounds + ' rounds x ' + $BootPar + ' concurrent creates must all boot')
+    Show 'msb pull alpine' (Invoke-Msb @('pull', 'alpine'))
+    $ok = 0
+    $failed = @()
+    for ($round = 1; $round -le $BootRounds; $round++) {
+        # Start every create of the round at once, each through cmd.exe with its output in a file
+        # (no pipes, see Invoke-Native), then wait for all of them.
+        $runs = @()
+        for ($i = 0; $i -lt $BootPar; $i++) {
+            $name = $Prefix + '-boot-' + $round + '-' + $i
+            $out = Join-Path $OutDir ($name + '.txt')
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+            $psi.Arguments = '/c ""' + $Msb + '" create alpine --name ' + $name + ' --replace > "' + $out + '" 2>&1 < NUL"'
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $runs += [pscustomobject]@{ Name = $name; Out = $out; P = [System.Diagnostics.Process]::Start($psi) }
+        }
+        $line = @()
+        foreach ($r in $runs) {
+            if (-not $r.P.WaitForExit(300000)) { $code = 124; $ms = 300000 } else {
+                $code = $r.P.ExitCode
+                $ms = [int]($r.P.ExitTime - $r.P.StartTime).TotalMilliseconds
+            }
+            if ($code -eq 0) { $ok++; $line += ('ok ' + $ms + 'ms') } else {
+                $text = ''
+                if (Test-Path $r.Out) { $text = (Get-Content -Encoding UTF8 -Path $r.Out | Out-String).Trim() }
+                $failed += $r.Name
+                $line += ('FAIL ' + $ms + 'ms')
+                Write-Output ('  ' + $r.Name + ': exit ' + $code)
+                $text -split "`n" | ForEach-Object { Write-Output ('      ' + $_.TrimEnd()) }
+                if ($failed.Count -eq 1) {
+                    $log = Join-Path $MsbHome ('sandboxes\' + $r.Name + '\logs\runtime.log')
+                    if (Test-Path $log) {
+                        Write-Output '  --- runtime.log (first failure, last lines)'
+                        Get-Content -Path $log | Select-Object -Last 8 | ForEach-Object { Write-Output ('      ' + $_) }
+                    }
+                }
+            }
+        }
+        Write-Output ('round ' + $round + ': ' + ($line -join ', '))
+        foreach ($r in $runs) { Remove-Sandbox $r.Name }
+    }
+    if ($failed.Count -gt 0) { Fail 'boot' ($failed.Count.ToString() + ' of ' + $n + ' creates did not boot (' + ($failed -join ', ') + ')'); return }
+    Pass 'boot' ('all ' + $n + ' creates booted, ' + $BootPar + ' at a time')
+}
+
 # ------------------------------------------------------------------------------------------- main
 Write-Output ('msb: ' + $Msb)
 Show 'msb --version' (Invoke-Msb @('--version'))
@@ -388,6 +445,7 @@ foreach ($c in $Case) {
         'forward' { Test-Forward }
         'stale-dir' { Test-StaleDir }
         'wedge' { Test-Wedge }
+        'boot' { Test-Boot }
     }
     Write-Output ('  (' + $c + ' took ' + [int]$t.Elapsed.TotalSeconds + ' s)')
 }
