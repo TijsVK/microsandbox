@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::num::NonZero;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
@@ -3083,48 +3083,98 @@ fn bind_identity_map_for_mount(
     Some(Arc::clone(handle))
 }
 
+/// Maximum size of `runtime.log` before it is rotated (three rotated files are kept).
+const RUNTIME_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Set up host log capture.
 ///
 /// Redirects stderr through a pipe so a background thread can write to a
-/// rotating log file (`runtime.log`). Stdout is redirected to `/dev/null`
-/// because kernel console output is routed to `kernel.log` directly via
-/// `console_output` in the VM builder.
+/// rotating log file (`runtime.log`). On Unix, stdout is redirected to
+/// `/dev/null` because kernel console output is routed to `kernel.log`
+/// directly via `console_output` in the VM builder. On Windows, stdout is
+/// left alone: it carries the startup events.
 ///
-/// If `forward` is true, stderr is also tee'd to the original fd.
-#[cfg(unix)]
+/// If `forward` is true, stderr is also tee'd to the original handle.
+///
+/// The pipe, the thread and the rotation are the same on every OS; only the
+/// swap of the process's stderr differs ([`redirect_stderr`]).
 fn setup_log_capture(log_dir: &std::path::Path, forward: bool) -> RuntimeResult<()> {
-    // Redirect stdout to /dev/null — kernel console goes to kernel.log
-    // via console_output, so nothing useful writes to stdout after the
-    // startup JSON. This prevents SIGPIPE when the parent drops the pipe.
-    let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
-    unsafe {
-        libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO);
+    #[cfg(unix)]
+    {
+        // Redirect stdout to /dev/null — kernel console goes to kernel.log
+        // via console_output, so nothing useful writes to stdout after the
+        // startup JSON. This prevents SIGPIPE when the parent drops the pipe.
+        let devnull = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+        unsafe {
+            libc::dup2(devnull.as_raw_fd(), libc::STDOUT_FILENO);
+        }
+        drop(devnull);
     }
-    drop(devnull);
 
     // Capture stderr → runtime.log (rotating).
-    let (stderr_read, stderr_write) = create_pipe()?;
+    let (stderr_read, stderr_write) = std::io::pipe()?;
+    let orig_stderr = redirect_stderr(stderr_write, forward)?;
 
-    let orig_stderr: Option<std::fs::File> = if forward {
+    spawn_log_thread(
+        "log-runtime",
+        stderr_read,
+        log_dir,
+        "runtime",
+        RUNTIME_LOG_MAX_BYTES,
+        orig_stderr,
+    )
+}
+
+/// Make `writer` the process's stderr. Returns the previous stderr when
+/// `forward` is set, and closes it otherwise.
+#[cfg(unix)]
+fn redirect_stderr(
+    writer: std::io::PipeWriter,
+    forward: bool,
+) -> RuntimeResult<Option<std::fs::File>> {
+    let orig_stderr = if forward {
         Some(unsafe { std::fs::File::from_raw_fd(libc::dup(libc::STDERR_FILENO)) })
     } else {
         None
     };
-
-    unsafe {
-        libc::dup2(stderr_write.as_raw_fd(), libc::STDERR_FILENO);
+    if unsafe { libc::dup2(writer.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+        return Err(RuntimeError::Io(std::io::Error::last_os_error()));
     }
-    drop(stderr_write);
-
-    spawn_log_thread("log-runtime", stderr_read, log_dir, "runtime", orig_stderr)?;
-
-    Ok(())
+    Ok(orig_stderr)
 }
 
-/// Set up host log capture.
+/// Make `writer` the process's stderr. Returns the previous stderr when
+/// `forward` is set, and closes it otherwise.
+///
+/// The SDK starts the runtime with stderr set to an append handle on
+/// `runtime.log`. Closing it here (when not forwarded) leaves the rotating
+/// writer as the only holder of the file in this process, like on Unix.
 #[cfg(windows)]
-fn setup_log_capture(_log_dir: &std::path::Path, _forward: bool) -> RuntimeResult<()> {
-    Ok(())
+fn redirect_stderr(
+    writer: std::io::PipeWriter,
+    forward: bool,
+) -> RuntimeResult<Option<std::fs::File>> {
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
+
+    let old = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    let new = writer.into_raw_handle();
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, new as _) } == 0 {
+        let err = std::io::Error::last_os_error();
+        drop(unsafe { std::fs::File::from_raw_handle(new) });
+        return Err(RuntimeError::Io(err));
+    }
+    if old.is_null() || old == INVALID_HANDLE_VALUE {
+        return Ok(None);
+    }
+    if forward {
+        Ok(Some(unsafe { std::fs::File::from_raw_handle(old as _) }))
+    } else {
+        unsafe { CloseHandle(old) };
+        Ok(None)
+    }
 }
 
 /// Write startup info JSON to the dedicated startup fd when supplied,
@@ -3354,31 +3404,19 @@ fn read_parent_watchdog_signal(file: &mut std::fs::File) -> std::io::Result<Pare
     }
 }
 
-/// Create a pipe pair, returning `(read_end, write_end)` as `OwnedFd`.
-#[cfg(unix)]
-fn create_pipe() -> RuntimeResult<(OwnedFd, OwnedFd)> {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(RuntimeError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
-/// Spawn a background thread that reads from a pipe and writes to a
-/// rotating log file. If `forward` is `Some`, also tees to that file
-/// (typically the original stdout/stderr saved before redirect).
-#[cfg(unix)]
+/// Spawn a background thread that reads from `reader` and writes to a
+/// rotating log file (`<log_prefix>.log`, rotated at `max_bytes`). If
+/// `forward` is `Some`, also tees to that file (typically the original
+/// stdout/stderr saved before redirect).
 fn spawn_log_thread(
     name: &str,
-    pipe_read: OwnedFd,
+    mut reader: impl std::io::Read + Send + 'static,
     log_dir: &std::path::Path,
     log_prefix: &str,
+    max_bytes: u64,
     forward: Option<std::fs::File>,
 ) -> RuntimeResult<()> {
     use crate::logging::RotatingLog;
-    use std::io::Read;
-
-    const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
     let log_dir = log_dir.to_path_buf();
     let log_prefix = log_prefix.to_string();
@@ -3386,14 +3424,13 @@ fn spawn_log_thread(
     std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            let mut log = match RotatingLog::new(&log_dir, &log_prefix, MAX_LOG_BYTES) {
+            let mut log = match RotatingLog::new(&log_dir, &log_prefix, max_bytes) {
                 Ok(log) => log,
                 Err(e) => {
                     let _ = writeln!(std::io::stderr(), "failed to create {log_prefix} log: {e}");
                     return;
                 }
             };
-            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_read.into_raw_fd()) };
             let mut fwd = forward;
             let mut buf = [0u8; 4096];
             loop {
@@ -3762,11 +3799,15 @@ mod tests {
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
     use microsandbox_protocol::{bootstrap::GuestBootstrap, codec, message::MessageType};
-    #[cfg(unix)]
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::fd::OwnedFd;
+    use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::sync::Arc;
     use std::time::Duration;
+
+    use super::RUNTIME_LOG_MAX_BYTES;
 
     fn fs_context() -> Context {
         Context {
@@ -4440,9 +4481,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_parent_watchdog_signal_reports_parent_exit_on_eof() {
-        let (read_fd, write_fd) = super::create_pipe().unwrap();
-        drop(write_fd);
-        let mut reader = std::fs::File::from(read_fd);
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(writer);
+        let mut reader = std::fs::File::from(OwnedFd::from(reader));
 
         let signal = read_parent_watchdog_signal(&mut reader).unwrap();
 
@@ -4452,14 +4493,146 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_parent_watchdog_signal_reports_detach_byte() {
-        let (read_fd, write_fd) = super::create_pipe().unwrap();
-        let mut writer = std::fs::File::from(write_fd);
+        let (reader, mut writer) = std::io::pipe().unwrap();
         writer.write_all(&[PARENT_WATCH_DETACH]).unwrap();
-        let mut reader = std::fs::File::from(read_fd);
+        let mut reader = std::fs::File::from(OwnedFd::from(reader));
 
         let signal = read_parent_watchdog_signal(&mut reader).unwrap();
 
         assert_eq!(signal, ParentWatchdogSignal::Detached);
+    }
+
+    /// Wait until the files `<prefix>.log*` in `dir` hold `want` bytes in total.
+    fn wait_for_log_bytes(dir: &Path, prefix: &str, want: u64) -> u64 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let total: u64 = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+                .map(|e| e.metadata().unwrap().len())
+                .sum();
+            if total >= want || std::time::Instant::now() > deadline {
+                return total;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn test_log_thread_rotates_at_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        super::spawn_log_thread("log-test", reader, dir.path(), "t", 1000, None).unwrap();
+
+        // 12 chunks of 400 bytes, two per 1000-byte file: the newest chunks are in `.log` and
+        // `.log.1` to `.log.3`; the oldest chunks have been rotated out of existence.
+        // The thread reads whatever the pipe holds, so wait for each chunk to land to keep
+        // the file boundaries deterministic.
+        let read = |name: &str| std::fs::read(dir.path().join(name)).unwrap_or_default();
+        for i in 0..12u8 {
+            let chunk = [b'a' + i; 400];
+            writer.write_all(&chunk).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !read("t.log").ends_with(&chunk) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "chunk {i} never landed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        drop(writer);
+
+        assert!(
+            read("t.log") == [vec![b'k'; 400], vec![b'l'; 400]].concat(),
+            "t.log"
+        );
+        assert!(
+            read("t.log.1") == [vec![b'i'; 400], vec![b'j'; 400]].concat(),
+            "t.log.1"
+        );
+        assert!(
+            read("t.log.2") == [vec![b'g'; 400], vec![b'h'; 400]].concat(),
+            "t.log.2"
+        );
+        assert!(
+            read("t.log.3") == [vec![b'e'; 400], vec![b'f'; 400]].concat(),
+            "t.log.3"
+        );
+        assert!(!dir.path().join("t.log.5").exists());
+    }
+
+    const CAPTURE_DIR_ENV: &str = "MSB_TEST_STDERR_CAPTURE_DIR";
+    const CAPTURE_LINE: usize = 1024;
+    const CAPTURE_LINES: usize = 11 * 1024;
+    const CAPTURE_MARKER: &str = "capture-done\n";
+
+    /// Body of the child process of [`test_stderr_capture_rotates_runtime_log_past_the_limit`].
+    /// A no-op in a normal test run: it redirects the whole process's stderr.
+    #[test]
+    fn test_stderr_capture_child() {
+        let Some(dir) = std::env::var_os(CAPTURE_DIR_ENV) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        super::setup_log_capture(&dir, false).unwrap();
+
+        let line = [b'x'; CAPTURE_LINE - 1];
+        let mut stderr = std::io::stderr();
+        for _ in 0..CAPTURE_LINES {
+            stderr.write_all(&line).unwrap();
+            stderr.write_all(b"\n").unwrap();
+        }
+        stderr.write_all(CAPTURE_MARKER.as_bytes()).unwrap();
+
+        // The log thread drains the pipe asynchronously: wait until the marker is on disk.
+        let want = (CAPTURE_LINE * CAPTURE_LINES + CAPTURE_MARKER.len()) as u64;
+        assert_eq!(wait_for_log_bytes(&dir, "runtime.log", want), want);
+    }
+
+    /// Writes 11 MiB to the real stderr of a process that ran `setup_log_capture`, and checks
+    /// that `runtime.log` rotated at 10 MiB. Runs on every OS: the redirect is the part that differs.
+    #[test]
+    fn test_stderr_capture_rotates_runtime_log_past_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let test_name = module_path!().split_once("::").unwrap().1;
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{test_name}::test_stderr_capture_child"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CAPTURE_DIR_ENV, dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let len = |name: &str| std::fs::metadata(dir.path().join(name)).map(|m| m.len());
+        let rotated = len("runtime.log.1").expect("runtime.log.1 exists after 11 MiB");
+        let current = len("runtime.log").unwrap();
+        assert!(
+            rotated <= RUNTIME_LOG_MAX_BYTES,
+            "rotated file is {rotated} bytes"
+        );
+        assert!(
+            current < RUNTIME_LOG_MAX_BYTES,
+            "current file is {current} bytes"
+        );
+        assert_eq!(
+            rotated + current,
+            (CAPTURE_LINE * CAPTURE_LINES + CAPTURE_MARKER.len()) as u64,
+            "no byte lost or duplicated"
+        );
+        assert!(len("runtime.log.2").is_err());
+        let tail = std::fs::read(dir.path().join("runtime.log")).unwrap();
+        assert!(tail.ends_with(CAPTURE_MARKER.as_bytes()));
     }
 
     #[test]
