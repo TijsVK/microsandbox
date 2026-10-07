@@ -5,7 +5,7 @@
 # A case PASSES when msb behaves as fixed and FAILS (with the evidence lines) when the bug shows.
 # Stock msb v0.7.7 fails the first seven; v0.7.7-puddle.2 passes the first five, v0.7.7-puddle.3 the
 # first six, v0.7.7-puddle.4 to .7 the first seven, v0.7.7-puddle.8 the first eight, v0.7.7-puddle.9
-# and later all nine.
+# the first nine, and later all ten.
 #
 #   relay      closing ssh -L channels while the guest closes the same TCP connections must not
 #              stop the VM ("cross-lane merge failed: bulk finish arrived before acceptance").
@@ -41,6 +41,13 @@
 #              upstream-issues/msb-bind-rootfs-dev). A stock build fails one 60-boot run almost always;
 #              the bind_rootfs unit tests are the exact check.
 #
+#   forward-cap  more than 64 forwards on one ssh session must all be served (stock: the 65th and
+#              later are refused, and through VS Code's port forwarder they hang). 200 held connections
+#              through Windows OpenSSH must all be greeted; then 300 through Git for Windows' ssh (it has no
+#              256-descriptor limit): the relay's limit is 256, so 44 opens are refused at first, msb retries
+#              them for up to 10 s, and they are served once 100 held connections close at 4 s
+#              (puddle upstream-issues/msb-forward-cap-retry).
+#
 # Evidence: creates in the boot, wedge and alpine cases run as `msb --debug create`, so the create's
 # output has the host-side SDK trace and runtime.log the VMM's debug trace (the guest's CMOS/RTC port
 # accesses among it). When a create fails, its whole logs\ directory (runtime.log, kernel.log,
@@ -55,7 +62,7 @@
 #
 # usage:
 #   powershell -ExecutionPolicy Bypass -File repros.ps1 -Msb <msb.exe> [-Libkrunfw <libkrunfw.dll>]
-#       [-Case relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp,boot-bind] [-Work <dir>] [-Prefix pr] [-Rounds 10]
+#       [-Case relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp,boot-bind,forward-cap] [-Work <dir>] [-Prefix pr] [-Rounds 10]
 #       [-BootRounds 10] [-BootPar 6] [-BootCpus 1] [-BootMemory 0] [-BootImage alpine]
 #       [-KeepGoodBoots 0] [-KernelCmdline '<extra guest cmdline, via MSB_KRUN_KERNEL_CMDLINE>']
 #       [-AgentdPath <agentd to boot instead of the embedded one, via MSB_AGENTD_PATH>]
@@ -67,7 +74,7 @@
 param(
     [Parameter(Mandatory = $true)] [string]$Msb,
     [string]$Libkrunfw = '',
-    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp', 'boot-bind'),
+    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp', 'boot-bind', 'forward-cap'),
     [string]$Work = '',
     [string]$Prefix = 'pr',
     [int]$Rounds = 10,
@@ -89,7 +96,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp', 'boot-bind')
+$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp', 'boot-bind', 'forward-cap')
 # -Case a,b arrives as one string when the script is started with -File.
 $Case = @($Case | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 foreach ($c in $Case) {
@@ -466,6 +473,95 @@ function Test-Wedge {
     Pass 'wedge' ('300 connections, hung=0 STALLED=0, data=' + $data)
 }
 
+function Start-SshForward {
+    # Starts `ssh -N -L 127.0.0.1:<port>:127.0.0.1:<guest port>` and waits until the port listens.
+    # $Git picks Git for Windows' ssh (MSYS: POSIX paths, ProxyCommand run by sh). Returns the process.
+    param([string]$Name, [int]$Port, [int]$GuestPort, [bool]$Git, [string]$Label)
+    if ($Git) {
+        $exe = 'C:\Program Files\Git\usr\bin\ssh.exe'
+        $u = { param($p) '/' + $p.Substring(0, 1).ToLower() + ($p.Substring(2) -replace '\\', '/') }
+        $cfg = Join-Path $Work ($Name + '-ssh_config_git')
+        Set-Content -Encoding Ascii -Path $cfg -Value @(
+            ('Host ' + $Name), '  User root',
+            ('  ProxyCommand "' + (& $u $Msb) + '" ssh serve %n --stdio'),
+            ('  IdentityFile ' + (& $u $script:Key)), '  IdentitiesOnly yes', '  IdentityAgent none', '  BatchMode yes',
+            '  LogLevel ERROR', '  StrictHostKeyChecking no', '  UserKnownHostsFile /dev/null')
+        $cfgArg = & $u $cfg
+    } else {
+        $exe = Join-Path $OpenSsh 'ssh.exe'
+        $cfgArg = Q (New-SshConfig $Name)
+    }
+    $p = Start-Process -FilePath $exe -WindowStyle Hidden -PassThru `
+        -RedirectStandardError (Join-Path $LogDir ($Label + '.log')) `
+        -RedirectStandardOutput (Join-Path $OutDir ($Label + '.out')) `
+        -ArgumentList @('-F', $cfgArg, '-N', '-o', 'ExitOnForwardFailure=yes',
+            '-L', ('127.0.0.1:' + $Port + ':127.0.0.1:' + $GuestPort), $Name)
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        if ($p.HasExited) { break }
+        if (@(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue).Count -gt 0) { break }
+    }
+    return $p
+}
+
+function Test-ForwardCap {
+    $name = $Prefix + '-fcap'
+    $port = $LocalPort + 5
+    Write-Output '=== forward-cap: 200 held forwards on one session, then 300 with a retry'
+    if (-not $NodeExe) { Fail 'forward-cap' ('node not found: ' + $Node); return }
+    $guestDir = Join-Path $Work 'fcap-guest'
+    New-Item -ItemType Directory -Force -Path $guestDir | Out-Null
+    $py = [System.IO.File]::ReadAllText((Join-Path $Here 'hold-server.py'))
+    [System.IO.File]::WriteAllText((Join-Path $guestDir 'hold-server.py'), ($py -replace "`r`n", "`n"))
+    $r = Invoke-Msb @('--debug', 'create', '--name', $name, '--replace', '--cpus', '2', '--memory', '1024',
+        '--mount-dir', (Q ($guestDir + ':/opt/repro:ro')), 'python:3.12-alpine')
+    Show ('msb create ' + $name) @{ Code = $r.Code; Text = $(if ($r.Code -eq 0) { '' } else { $r.Text }) }
+    if ($r.Code -ne 0) { Save-FailedCreate $name $r.Text; Fail 'forward-cap' 'precondition: create failed'; return }
+    $r = Invoke-Msb @('exec', '--no-tty', '--no-stdin', $name, '--', 'sh', '-c',
+        (Q 'nohup python3 /opt/repro/hold-server.py 18095 >/tmp/hold.log 2>&1 &'))
+    Show 'guest server start' $r
+    Initialize-Key
+    $gitSsh = 'C:\Program Files\Git\usr\bin\ssh.exe'
+    $verdict = $null
+    $summary = ''
+    foreach ($phase in @(
+            @{ Label = 'plain'; Git = $false; N = 200; Release = 0; Port = $port },
+            @{ Label = 'retry'; Git = $true; N = 300; Release = 100; Port = ($port + 1) })) {
+        if ($verdict) { break }
+        if ($phase.Git -and -not (Test-Path -LiteralPath $gitSsh)) { $verdict = 'precondition: no Git for Windows ssh at ' + $gitSsh; break }
+        $ssh = Start-SshForward $name $phase.Port 18095 $phase.Git ('fcap-' + $phase.Label)
+        try {
+            if ($ssh.HasExited) {
+                Get-Content -Path (Join-Path $LogDir ('fcap-' + $phase.Label + '.log')) | ForEach-Object { Write-Output ('  ssh -L: ' + $_) }
+                $verdict = 'precondition: ssh -L exited at start (' + $phase.Label + ')'
+                break
+            }
+            $c = @(& $NodeExe (Join-Path $Here 'cap-client.mjs') $phase.Port $phase.N $phase.Release 4000 40000 2>&1)
+            $c | ForEach-Object { Write-Output ('  ' + $phase.Label + ': ' + $_) }
+            $line = [string]$c[0]
+        } finally {
+            if ($ssh -and -not $ssh.HasExited) { Stop-Process -Id $ssh.Id -Force }
+        }
+        if ($line -notmatch 'greeted=(\d+) reset=(\d+) closed=(\d+) timeout=(\d+) maxGreetMs=(\d+) lateGreeted=(\d+)') {
+            $verdict = 'no summary line from the client (' + $phase.Label + '): ' + $line
+            break
+        }
+        $g = [int]$Matches[1]; $bad = [int]$Matches[2] + [int]$Matches[3] + [int]$Matches[4]
+        $maxMs = [int]$Matches[5]; $late = [int]$Matches[6]
+        if ($g -ne $phase.N) { $verdict = $phase.Label + ': only ' + $g + ' of ' + $phase.N + ' forwards served (' + $bad + ' reset, closed or hung)'; break }
+        if ($phase.Release -gt 0) {
+            # The vacuous-pass guard: the last forwards must really have waited for a slot. They can be
+            # served only after the release at 4 s, and within the 10 s retry window after the first refusal.
+            if ($late -lt 1 -or $maxMs -lt 3500) { $verdict = 'precondition: nothing was queued (late=' + $late + ', max greet ' + $maxMs + ' ms)'; break }
+            if ($maxMs -gt 12000) { $verdict = 'queued forwards took ' + $maxMs + ' ms (> 12 s)'; break }
+        }
+        $summary += $phase.Label + ' ' + $g + '/' + $phase.N + ' (max ' + $maxMs + ' ms, ' + $late + ' after the release); '
+    }
+    Remove-Sandbox $name
+    if ($verdict) { Fail 'forward-cap' $verdict; return }
+    Pass 'forward-cap' ($summary.TrimEnd('; '))
+}
+
 function Test-Boot {
     $n = $BootRounds * $BootPar
     $shape = $BootImage + ', ' + $BootCpus + ' vCPU' + $(if ($BootMemory -gt 0) { ', ' + $BootMemory + ' MiB' } else { '' })
@@ -573,6 +669,7 @@ foreach ($c in $Case) {
         'boot' { Test-Boot }
         'boot-smp' { $script:BootCpus = 2; if ($BootMemory -le 0) { $script:BootMemory = 1024 }; Test-Boot }
         'boot-bind' { $script:BootImage = 'probe'; Test-Boot }
+        'forward-cap' { Test-ForwardCap }
     }
     Write-Output ('  (' + $c + ' took ' + [int]$t.Elapsed.TotalSeconds + ' s)')
 }
