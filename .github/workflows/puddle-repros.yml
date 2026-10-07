@@ -2,7 +2,7 @@
 #
 # Fork-only file. The cases live in tests/puddle/repros.ps1 (relay crash, ssh signal exit, scp
 # exit, forward reason, stale dir on a rejected create, russh session wedge, boots under load, 2-vCPU
-# boots without a console at PID 1). Each
+# boots without a console at PID 1, bind-root boots without /dev). Each
 # passes when msb behaves as fixed.
 #
 # * workflow_call from puddle-release.yml: tests the msb.exe that run just built (artifact
@@ -33,7 +33,7 @@ on:
       cases:
         description: "Comma-separated cases (default all)"
         required: false
-        default: "relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp"
+        default: "relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp,boot-bind"
         type: string
 
 permissions:
@@ -47,13 +47,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [relay, signal, scp, forward, stale-dir, wedge, boot, boot-smp]
+        case: [relay, signal, scp, forward, stale-dir, wedge, boot, boot-smp, boot-bind]
     steps:
       - name: Skip cases not asked for
         id: want
         shell: pwsh
         env:
-          CASES: ${{ inputs.cases || 'relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp' }}
+          CASES: ${{ inputs.cases || 'relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp,boot-bind' }}
         run: |
           $want = ($env:CASES -split ',' | ForEach-Object { $_.Trim() }) -contains '${{ matrix.case }}'
           "run=$($want.ToString().ToLower())" >> $env:GITHUB_OUTPUT
