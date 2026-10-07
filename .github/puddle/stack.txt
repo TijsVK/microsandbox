@@ -29,6 +29,7 @@ pick      | fix(runtime): give a bind rootfs a /dev before the guest boots      
 pick      | fix(runtime): raise the per-client forward limit from 64 to 256         | msb-forward-cap-retry                   | -
 pick      | fix(ssh): retry a forward refused for the per-client limit              | msb-forward-cap-retry                   | -
 pick      | fix(runtime): rotate runtime.log on Windows like on Unix                | msb-windows-log-rotation                | -
+pick      | test(runtime): size the log files by path in the rotation test          | msb-windows-log-rotation                | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
