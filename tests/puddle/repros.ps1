@@ -42,6 +42,7 @@
 #       [-Case relay,signal,scp,forward,stale-dir,wedge,boot] [-Work <dir>] [-Prefix pr] [-Rounds 10]
 #       [-BootRounds 10] [-BootPar 6] [-BootCpus 1] [-BootMemory 0] [-BootImage alpine]
 #       [-KeepGoodBoots 0] [-KernelCmdline '<extra guest cmdline, via MSB_KRUN_KERNEL_CMDLINE>']
+#       [-AgentdPath <agentd to boot instead of the embedded one, via MSB_AGENTD_PATH>]
 #       [-Node node] [-OpenSsh <dir with ssh.exe, scp.exe, ssh-keygen.exe>] [-LocalPort 18190]
 # Exit code: 0 when every case passed, 1 when one failed, 2 on bad usage.
 # Nothing is deleted: the script prints the work dir to remove when done.
@@ -64,6 +65,7 @@ param(
     [string]$BootImage = 'alpine',
     [int]$KeepGoodBoots = 0,
     [string]$KernelCmdline = '',
+    [string]$AgentdPath = '',
     [string]$Node = 'node',
     [string]$OpenSsh = (Join-Path $env:SystemRoot 'System32\OpenSSH')
 )
@@ -88,6 +90,7 @@ $env:MSB_PATH = $Msb
 if ($Libkrunfw -ne '') { $env:MSB_LIBKRUNFW_PATH = (Resolve-Path -LiteralPath $Libkrunfw).Path }
 # libkrun appends this to the guest command line (a debug hatch, e.g. 'loglevel=8' for a full kernel.log).
 if ($KernelCmdline -ne '') { $env:MSB_KRUN_KERNEL_CMDLINE = $KernelCmdline }
+if ($AgentdPath -ne '') { $env:MSB_AGENTD_PATH = (Resolve-Path -LiteralPath $AgentdPath).Path }
 $NodeExe = (Get-Command $Node -ErrorAction SilentlyContinue).Source
 $script:Failed = @()
 $script:Passed = @()
@@ -503,7 +506,8 @@ function Test-Boot {
 # ------------------------------------------------------------------------------------------- main
 Write-Output ('msb: ' + $Msb)
 Show 'msb --version' (Invoke-Msb @('--version'))
-Write-Output ('MSB_HOME: ' + $MsbHome + '; cases: ' + ($Case -join ', ') + $(if ($KernelCmdline -ne '') { '; MSB_KRUN_KERNEL_CMDLINE=' + $KernelCmdline } else { '' }))
+Write-Output ('MSB_HOME: ' + $MsbHome + '; cases: ' + ($Case -join ', ') + $(if ($KernelCmdline -ne '') { '; MSB_KRUN_KERNEL_CMDLINE=' + $KernelCmdline } else { '' }) +
+    $(if ($AgentdPath -ne '') { '; MSB_AGENTD_PATH=' + $env:MSB_AGENTD_PATH } else { '' }))
 $t0 = [Diagnostics.Stopwatch]::StartNew()
 foreach ($c in $Case) {
     $t = [Diagnostics.Stopwatch]::StartNew()
