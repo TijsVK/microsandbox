@@ -8,6 +8,8 @@ use std::{
 };
 
 use microsandbox_filesystem::agentd::agentd_bytes;
+
+use crate::vm::BOOTSTRAP_MOUNTPOINTS;
 use msb_krun::backends::fs::{
     Context, DirEntry, DynFileSystem, Entry, FsOptions, OpenOptions, ZeroCopyWriter, stat64,
     statvfs64,
@@ -185,15 +187,26 @@ impl AgentBootstrapFs {
 }
 
 impl DirState {
+    /// The root with `init.krun` and the same mountpoints as the unix trampoline root
+    /// ([`BOOTSTRAP_MOUNTPOINTS`]). Without `dev` the kernel's devtmpfs automount fails, and a
+    /// PID 1 that the kernel started without a console (the virtio-console port arrived after
+    /// `console_on_rootfs()`) finds no `/dev/null`: Rust's runtime then aborts before `main`, the
+    /// guest panics on the dead init and the VM exits 0 before the agent relay is up.
     fn new() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(ROOT_INODE, DirNode { parent: ROOT_INODE });
 
-        Self {
+        let mut state = Self {
             next_inode: INIT_INODE + 1,
             nodes,
             children: BTreeMap::new(),
+        };
+        for name in BOOTSTRAP_MOUNTPOINTS {
+            state
+                .mkdir(ROOT_INODE, name.as_bytes())
+                .expect("bootstrap mountpoints are distinct, valid names");
         }
+        state
     }
 
     fn lookup(&self, parent: u64, name: &[u8]) -> io::Result<u64> {
@@ -636,6 +649,57 @@ mod tests {
             gid: 0,
             pid: 0,
         }
+    }
+
+    #[test]
+    fn root_starts_with_the_unix_trampoline_mountpoints() {
+        let dirs = DirState::new();
+        let mut names: Vec<Vec<u8>> = dirs
+            .child_entries(ROOT_INODE)
+            .unwrap()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect();
+        names.sort();
+        let mut want: Vec<Vec<u8>> = BOOTSTRAP_MOUNTPOINTS
+            .iter()
+            .map(|name| name.as_bytes().to_vec())
+            .collect();
+        want.sort();
+        assert_eq!(names, want);
+        assert!(
+            want.contains(&b"dev".to_vec()),
+            "devtmpfs needs /dev before PID 1 runs"
+        );
+
+        // The kernel mounts devtmpfs on this directory; agentd's own mkdir then sees EEXIST.
+        let dev = dirs.lookup(ROOT_INODE, b"dev").unwrap();
+        assert!(dirs.contains_dir(dev));
+        assert_eq!(dirs.parent(dev), Some(ROOT_INODE));
+        let again = DirState::new().mkdir(ROOT_INODE, b"dev").err().unwrap();
+        assert_eq!(again.raw_os_error(), Some(LINUX_EEXIST));
+        assert!(dirs.next_inode > INIT_INODE + BOOTSTRAP_MOUNTPOINTS.len() as u64);
+    }
+
+    #[test]
+    fn a_fresh_root_survives_a_mobility_round_trip() {
+        let dirs = DirState::new();
+        let state = BootstrapMobilityState {
+            version: MOBILITY_STATE_VERSION,
+            next_inode: dirs.next_inode,
+            nodes: dirs.nodes.iter().map(|(i, n)| (*i, n.parent)).collect(),
+            children: dirs
+                .children
+                .iter()
+                .map(|((p, name), c)| (*p, name.clone(), *c))
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let restored = AgentBootstrapFs::decode_mobility_state(&bytes).unwrap();
+        assert_eq!(
+            restored.lookup(ROOT_INODE, b"dev").unwrap(),
+            dirs.lookup(ROOT_INODE, b"dev").unwrap()
+        );
     }
 
     #[test]

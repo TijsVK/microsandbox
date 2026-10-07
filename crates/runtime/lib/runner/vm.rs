@@ -2896,6 +2896,12 @@ fn macos_maxfilesperproc() -> Option<libc::rlim_t> {
     (ret == 0 && maxfiles > 0).then_some(maxfiles as libc::rlim_t)
 }
 
+/// Directories the guest's bootstrap root holds from the start, on every host. `dev` matters
+/// before PID 1 runs: the kernel mounts devtmpfs there, so `/dev/null` exists for agentd's
+/// runtime even when the kernel could not give PID 1 a console (`/dev/console` has no driver
+/// until the virtio-console port arrives, which races with init under host load).
+pub(crate) const BOOTSTRAP_MOUNTPOINTS: [&str; 5] = ["dev", "sys", "proc", ".msb", "newroot"];
+
 /// Build the runtime-owned bootstrap filesystem used before a block root pivots.
 ///
 /// Agentd creates these mountpoints before switching to the durable block root.
@@ -2904,7 +2910,7 @@ fn macos_maxfilesperproc() -> Option<libc::rlim_t> {
 #[cfg(unix)]
 fn bootstrap_trampoline_backend() -> RuntimeResult<PassthroughFs> {
     let trampoline = tempfile::tempdir()?;
-    for directory in ["dev", "sys", "proc", ".msb", "newroot"] {
+    for directory in BOOTSTRAP_MOUNTPOINTS {
         std::fs::create_dir(trampoline.path().join(directory)).map_err(|error| {
             RuntimeError::Custom(format!("create bootstrap mountpoint {directory}: {error}"))
         })?;
