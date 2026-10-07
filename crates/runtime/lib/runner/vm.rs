@@ -4510,7 +4510,9 @@ mod tests {
                 .unwrap()
                 .filter_map(Result::ok)
                 .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
-                .map(|e| e.metadata().unwrap().len())
+                // Not `DirEntry::metadata`: on Windows it reports the size from the directory
+                // listing, which lags behind a file that is still open for writing.
+                .map(|e| std::fs::metadata(e.path()).map_or(0, |m| m.len()))
                 .sum();
             if total >= want || std::time::Instant::now() > deadline {
                 return total;
@@ -4588,7 +4590,15 @@ mod tests {
 
         // The log thread drains the pipe asynchronously: wait until the marker is on disk.
         let want = (CAPTURE_LINE * CAPTURE_LINES + CAPTURE_MARKER.len()) as u64;
-        assert_eq!(wait_for_log_bytes(&dir, "runtime.log", want), want);
+        let got = wait_for_log_bytes(&dir, "runtime.log", want);
+        // The child's stderr is the log, so a failure is only visible in a file next to it.
+        if got != want {
+            let _ = std::fs::write(
+                dir.join("child-error.txt"),
+                format!("{got} of {want} bytes"),
+            );
+        }
+        assert_eq!(got, want);
     }
 
     /// Writes 11 MiB to the real stderr of a process that ran `setup_log_capture`, and checks
@@ -4609,9 +4619,10 @@ mod tests {
             .unwrap();
         assert!(
             out.status.success(),
-            "child failed: {}\n{}",
+            "child failed: {}\n{}\n{}",
             String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&out.stderr),
+            std::fs::read_to_string(dir.path().join("child-error.txt")).unwrap_or_default()
         );
 
         let len = |name: &str| std::fs::metadata(dir.path().join(name)).map(|m| m.len());
