@@ -318,8 +318,9 @@ jobs:
       # The Windows-only bootstrap root (crates/runtime/lib/runner/bootstrap_fs.rs) has no other CI:
       # its mountpoints keep PID 1 alive when the kernel starts it without a console (T-164). The
       # bind_rootfs tests check the same /dev for host-directory roots on the Windows file system
-      # (T-209).
-      - name: Runtime bootstrap-root and bind-root tests
+      # (T-209). The log tests write 11 MiB to the real stderr of a child process that ran
+      # setup_log_capture and check that runtime.log rotated, which Windows did not do before (T-210).
+      - name: Runtime bootstrap-root, bind-root and log-rotation tests
         shell: pwsh
         env:
           RUSTFLAGS: -C target-feature=+crt-static
@@ -329,8 +330,8 @@ jobs:
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture amd64 -HostArchitecture amd64
           cargo test --locked --release --no-default-features --features embed-binaries,net,runner `
-            -p microsandbox-runtime --lib --target $env:RUST_TARGET -- bootstrap_fs bind_rootfs
-          if ($LASTEXITCODE -ne 0) { throw "bootstrap_fs / bind_rootfs tests failed" }
+            -p microsandbox-runtime --lib --target $env:RUST_TARGET -- bootstrap_fs bind_rootfs log_thread stderr_capture
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap_fs / bind_rootfs / log-rotation tests failed" }
 
       - name: Embedded agentd is this run's
         shell: pwsh
