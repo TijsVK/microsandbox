@@ -43,6 +43,7 @@
 #       [-BootRounds 10] [-BootPar 6] [-BootCpus 1] [-BootMemory 0] [-BootImage alpine]
 #       [-KeepGoodBoots 0] [-KernelCmdline '<extra guest cmdline, via MSB_KRUN_KERNEL_CMDLINE>']
 #       [-AgentdPath <agentd to boot instead of the embedded one, via MSB_AGENTD_PATH>]
+#       [-KeepIfKernelLog <regex: also keep and count good boots whose kernel.log matches>]
 #       [-Node node] [-OpenSsh <dir with ssh.exe, scp.exe, ssh-keygen.exe>] [-LocalPort 18190]
 # Exit code: 0 when every case passed, 1 when one failed, 2 on bad usage.
 # Nothing is deleted: the script prints the work dir to remove when done.
@@ -66,6 +67,7 @@ param(
     [int]$KeepGoodBoots = 0,
     [string]$KernelCmdline = '',
     [string]$AgentdPath = '',
+    [string]$KeepIfKernelLog = '',
     [string]$Node = 'node',
     [string]$OpenSsh = (Join-Path $env:SystemRoot 'System32\OpenSSH')
 )
@@ -450,6 +452,7 @@ function Test-Boot {
     $ok = 0
     $failed = @()
     $script:GoodKept = 0
+    $marks = 0
     for ($round = 1; $round -le $BootRounds; $round++) {
         # Start every create of the round at once, each through cmd.exe with its output in a file
         # (no pipes, see Invoke-Native), then wait for all of them.
@@ -472,7 +475,11 @@ function Test-Boot {
             }
             if ($code -eq 0) {
                 $ok++; $line += ('ok ' + $ms + 'ms')
-                if ($script:GoodKept -lt $KeepGoodBoots) {
+                $klog = Join-Path $MsbHome ('sandboxes\' + $r.Name + '\logs\kernel.log')
+                $marked = ($KeepIfKernelLog -ne '') -and (Test-Path $klog) -and
+                    (@(Select-String -Path $klog -Pattern $KeepIfKernelLog).Count -gt 0)
+                if ($marked) { $marks++; Write-Output ('  ' + $r.Name + ': kernel.log matches ' + $KeepIfKernelLog) }
+                if ($marked -or $script:GoodKept -lt $KeepGoodBoots) {
                     # A good boot's logs, to compare a failure against.
                     $script:GoodKept++
                     $src = Join-Path $MsbHome ('sandboxes\' + $r.Name + '\logs')
@@ -498,7 +505,8 @@ function Test-Boot {
             Invoke-Msb @('rm', '-f', $r.Name) 120 | Out-Null
         }
     }
-    Write-Output ('boot-summary: shape=' + $shape + ' par=' + $BootPar + ' boots=' + $n + ' failed=' + $failed.Count)
+    Write-Output ('boot-summary: shape=' + $shape + ' par=' + $BootPar + ' boots=' + $n + ' failed=' + $failed.Count +
+        $(if ($KeepIfKernelLog -ne '') { ' kernel-log-matches=' + $marks } else { '' }))
     if ($failed.Count -gt 0) { Fail 'boot' ($failed.Count.ToString() + ' of ' + $n + ' creates did not boot (' + ($failed -join ', ') + ')'); return }
     Pass 'boot' ('all ' + $n + ' creates booted, ' + $BootPar + ' at a time')
 }
