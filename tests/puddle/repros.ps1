@@ -4,7 +4,8 @@
 # Each case is the repro from puddle's upstream-issues/msb-* folder turned into a pass/fail test.
 # A case PASSES when msb behaves as fixed and FAILS (with the evidence lines) when the bug shows.
 # Stock msb v0.7.7 fails the first seven; v0.7.7-puddle.2 passes the first five, v0.7.7-puddle.3 the
-# first six, v0.7.7-puddle.4 to .7 the first seven, v0.7.7-puddle.8 and later all eight.
+# first six, v0.7.7-puddle.4 to .7 the first seven, v0.7.7-puddle.8 the first eight, v0.7.7-puddle.9
+# and later all nine.
 #
 #   relay      closing ssh -L channels while the guest closes the same TCP connections must not
 #              stop the VM ("cross-lane merge failed: bulk finish arrived before acceptance").
@@ -23,7 +24,9 @@
 #              the agent relay was up (libkrun fork bdf711f0, no_timer_check on WHP; puddle
 #              upstream-issues/msb-windows-boot-race). -BootCpus/-BootMemory/-BootImage pick the
 #              guest; the defaults (1 vCPU, alpine) are the T-096 case. -BootCpus 2 is the shape of the
-#              residual early exits T-164 chases.
+#              residual early exits T-164 chases. -BootImage probe is puddle doctor's test boot: each
+#              boot gets a fresh bind root directory holding only a 132-byte static probe (exit_group(42))
+#              and /etc/passwd, booted with `msb run <dir> -- /probe`; exit code 42 means it booted.
 #   boot-smp   the boot case with 2 vCPUs and 1024 MiB. About 3% of such boots lost PID 1 before
 #              the relay (stock -puddle.7: 34 of 1200 on windows-2025 at 6 concurrent): when the
 #              virtio-console port arrived after the kernel's console_on_rootfs(), agentd started
@@ -31,6 +34,12 @@
 #              aborted (fork fix: bootstrap root gets the unix mountpoints, dev first; puddle
 #              upstream-issues/msb-windows-bootstrap-root-dev). Not deterministic: a stock build
 #              fails one 60-boot run with ~84% probability; bootstrap_fs unit tests are the exact check.
+#   boot-bind  the boot case with -BootImage probe (1 vCPU): a fresh bind root without dev\ per boot,
+#              puddle doctor's test boot. The same PID 1 abort as boot-smp through the other root
+#              kind: no /dev in the bind root, so no devtmpfs before PID 1 (stock -puddle.8: about 9%
+#              of boots; fork fix: msb creates dev in a bind root that lacks it; puddle
+#              upstream-issues/msb-bind-rootfs-dev). A stock build fails one 60-boot run almost always;
+#              the bind_rootfs unit tests are the exact check.
 #
 # Evidence: creates in the boot, wedge and alpine cases run as `msb --debug create`, so the create's
 # output has the host-side SDK trace and runtime.log the VMM's debug trace (the guest's CMOS/RTC port
@@ -46,7 +55,7 @@
 #
 # usage:
 #   powershell -ExecutionPolicy Bypass -File repros.ps1 -Msb <msb.exe> [-Libkrunfw <libkrunfw.dll>]
-#       [-Case relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp] [-Work <dir>] [-Prefix pr] [-Rounds 10]
+#       [-Case relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp,boot-bind] [-Work <dir>] [-Prefix pr] [-Rounds 10]
 #       [-BootRounds 10] [-BootPar 6] [-BootCpus 1] [-BootMemory 0] [-BootImage alpine]
 #       [-KeepGoodBoots 0] [-KernelCmdline '<extra guest cmdline, via MSB_KRUN_KERNEL_CMDLINE>']
 #       [-AgentdPath <agentd to boot instead of the embedded one, via MSB_AGENTD_PATH>]
@@ -58,7 +67,7 @@
 param(
     [Parameter(Mandatory = $true)] [string]$Msb,
     [string]$Libkrunfw = '',
-    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp'),
+    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp', 'boot-bind'),
     [string]$Work = '',
     [string]$Prefix = 'pr',
     [int]$Rounds = 10,
@@ -80,7 +89,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp')
+$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp', 'boot-bind')
 # -Case a,b arrives as one string when the script is started with -File.
 $Case = @($Case | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 foreach ($c in $Case) {
@@ -163,13 +172,21 @@ function Save-FailedCreate {
         $m = Select-String -Path $rt -Pattern 'using vcpu exit code: (\S+)' | Select-Object -Last 1
         if ($m) { $exitCode = $m.Matches[0].Groups[1].Value }
     }
-    if (Test-Path $kl) { $klBytes = (Get-Item $kl).Length }
+    $initTrap = 0; $devtmpfs = 'unknown'
+    if (Test-Path $kl) {
+        $klBytes = (Get-Item $kl).Length
+        # T-164's signature: PID 1 (init.krun) dies in musl's abort() (hlt, #GP) when it started
+        # without stdio and found no /dev/null. Needs a verbose guest (loglevel=8) to be printed.
+        $initTrap = @(Select-String -Path $kl -Pattern 'init\.krun\[1\] general protection').Count
+        if (@(Select-String -Path $kl -Pattern 'devtmpfs: error mounting').Count -gt 0) { $devtmpfs = 'error' }
+        elseif (@(Select-String -Path $kl -Pattern 'devtmpfs: mounted').Count -gt 0) { $devtmpfs = 'mounted' }
+    }
     $kind = 'other'
     if ($polls -ge 80 -and $klBytes -le 0) { $kind = 'timer-check-panic' }
     elseif ($klBytes -gt 0) { $kind = 'guest-console-up' }
     Write-Output ('  boot-evidence ' + $Name + ': kind=' + $kind + ' rtc-c-polls=' + $polls + ' kernel.log=' + $klBytes +
         'B runtime.log=' + $rtBytes + 'B vmm-stopping=' + $vmmStop + ' vcpu-exit-code=' + $exitCode +
-        ' unhandled-reason-4=' + $reason4 + ' (kept in ' + $dst + ')')
+        ' unhandled-reason-4=' + $reason4 + ' init-trap=' + $initTrap + ' devtmpfs=' + $devtmpfs + ' (kept in ' + $dst + ')')
     if (Test-Path $kl) {
         Write-Output '  --- kernel.log (last 15 lines)'
         Get-Content -Path $kl | Select-Object -Last 15 | ForEach-Object { Write-Output ('      ' + $_) }
@@ -453,7 +470,16 @@ function Test-Boot {
     $n = $BootRounds * $BootPar
     $shape = $BootImage + ', ' + $BootCpus + ' vCPU' + $(if ($BootMemory -gt 0) { ', ' + $BootMemory + ' MiB' } else { '' })
     Write-Output ('=== boot: ' + $BootRounds + ' rounds x ' + $BootPar + ' concurrent creates must all boot (' + $shape + ')')
-    Show ('msb pull ' + $BootImage) (Invoke-Msb @('pull', $BootImage))
+    $probe = ($BootImage -eq 'probe')
+    if ($probe) {
+        # puddle doctor's probe: ELF header, one PT_LOAD, mov edi,42; mov eax,231; syscall.
+        $hex = '7f454c4602010100000000000000000002003e0001000000780040000000000040000000000000000000000000000000000000004000380001004000000000000100000005000000000000000000000000004000000000000000400000000000840000000000000084000000000000000010000000000000bf2a000000b8e70000000f05'
+        $probeBytes = New-Object byte[] ($hex.Length / 2)
+        for ($b = 0; $b -lt $probeBytes.Length; $b++) { $probeBytes[$b] = [Convert]::ToByte($hex.Substring(2 * $b, 2), 16) }
+        $RootsDir = Join-Path $Work 'roots'
+    } else {
+        Show ('msb pull ' + $BootImage) (Invoke-Msb @('pull', $BootImage))
+    }
     $res = ' --cpus ' + $BootCpus
     if ($BootMemory -gt 0) { $res += ' --memory ' + $BootMemory }
     $ok = 0
@@ -469,7 +495,18 @@ function Test-Boot {
             $out = Join-Path $OutDir ($name + '.txt')
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
-            $psi.Arguments = '/c ""' + $Msb + '" --debug create ' + $BootImage + ' --name ' + $name + $res + ' --replace > "' + $out + '" 2>&1 < NUL"'
+            if ($probe) {
+                # A fresh root per boot: agentd's own mkdir leaves a dev\ behind after the first boot.
+                $root = Join-Path $RootsDir $name
+                New-Item -ItemType Directory -Force -Path (Join-Path $root 'etc') | Out-Null
+                [System.IO.File]::WriteAllBytes((Join-Path $root 'probe'), $probeBytes)
+                [System.IO.File]::WriteAllText((Join-Path $root 'etc\passwd'), "root:x:0:0:root:/:/probe`n")
+                [System.IO.File]::WriteAllText((Join-Path $root 'etc\group'), "root:x:0:`n")
+                $verb = ' --debug run "' + $root + '" --name ' + $name + $res + ' --replace --no-stdin -- /probe'
+            } else {
+                $verb = ' --debug create ' + $BootImage + ' --name ' + $name + $res + ' --replace'
+            }
+            $psi.Arguments = '/c ""' + $Msb + '"' + $verb + ' > "' + $out + '" 2>&1 < NUL"'
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
             $runs += [pscustomobject]@{ Name = $name; Out = $out; P = [System.Diagnostics.Process]::Start($psi) }
@@ -480,7 +517,7 @@ function Test-Boot {
                 $code = $r.P.ExitCode
                 $ms = [int]($r.P.ExitTime - $r.P.StartTime).TotalMilliseconds
             }
-            if ($code -eq 0) {
+            if ($code -eq $(if ($probe) { 42 } else { 0 })) {
                 $ok++; $line += ('ok ' + $ms + 'ms')
                 $klog = Join-Path $MsbHome ('sandboxes\' + $r.Name + '\logs\kernel.log')
                 $marked = ($KeepIfKernelLog -ne '') -and (Test-Path $klog) -and
@@ -535,6 +572,7 @@ foreach ($c in $Case) {
         'wedge' { Test-Wedge }
         'boot' { Test-Boot }
         'boot-smp' { $script:BootCpus = 2; if ($BootMemory -le 0) { $script:BootMemory = 1024 }; Test-Boot }
+        'boot-bind' { $script:BootImage = 'probe'; Test-Boot }
     }
     Write-Output ('  (' + $c + ' took ' + [int]$t.Elapsed.TotalSeconds + ' s)')
 }
