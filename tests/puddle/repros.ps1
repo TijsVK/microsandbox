@@ -21,7 +21,16 @@
 #   boot       -BootRounds rounds of -BootPar concurrent creates must all boot. Under host load the
 #              guest's IO-APIC timer check lost PIT ticks and panicked, so the VM exited 0 before
 #              the agent relay was up (libkrun fork bdf711f0, no_timer_check on WHP; puddle
-#              upstream-issues/msb-windows-boot-race).
+#              upstream-issues/msb-windows-boot-race). -BootCpus/-BootMemory/-BootImage pick the
+#              guest; the defaults (1 vCPU, alpine) are the T-096 case. -BootCpus 2 is the shape of the
+#              residual early exits T-164 chases.
+#
+# Evidence: creates in the boot, wedge and alpine cases run as `msb --debug create`, so the create's
+# output has the host-side SDK trace and runtime.log the VMM's debug trace (the guest's CMOS/RTC port
+# accesses among it). When a create fails, its whole logs\ directory (runtime.log, kernel.log,
+# boot-error.json) is copied to <work>\logs\sandboxes\<name>\ with the create's output, and one
+# "boot-evidence" line classifies it: rtc-c-polls=90 with an empty kernel.log is the T-096 guest
+# timer-check panic; anything else is a different early exit.
 #
 # Windows PowerShell 5.1 safe (ASCII only). Needs Windows OpenSSH, node 18+ (relay only) and
 # network for alpine and python:3.12-alpine. Uses its own MSB_HOME under -Work.
@@ -31,7 +40,7 @@
 # usage:
 #   powershell -ExecutionPolicy Bypass -File repros.ps1 -Msb <msb.exe> [-Libkrunfw <libkrunfw.dll>]
 #       [-Case relay,signal,scp,forward,stale-dir,wedge,boot] [-Work <dir>] [-Prefix pr] [-Rounds 10]
-#       [-BootRounds 10] [-BootPar 6]
+#       [-BootRounds 10] [-BootPar 6] [-BootCpus 1] [-BootMemory 0] [-BootImage alpine]
 #       [-Node node] [-OpenSsh <dir with ssh.exe, scp.exe, ssh-keygen.exe>] [-LocalPort 18190]
 # Exit code: 0 when every case passed, 1 when one failed, 2 on bad usage.
 # Nothing is deleted: the script prints the work dir to remove when done.
@@ -49,6 +58,9 @@ param(
     [int]$LocalPort = 18190,
     [int]$BootRounds = 10,
     [int]$BootPar = 6,
+    [int]$BootCpus = 1,
+    [int]$BootMemory = 0,
+    [string]$BootImage = 'alpine',
     [string]$Node = 'node',
     [string]$OpenSsh = (Join-Path $env:SystemRoot 'System32\OpenSSH')
 )
@@ -114,6 +126,43 @@ function Save-RuntimeLog {
     if (Test-Path $log) { Copy-Item -Path $log -Destination (Join-Path $LogDir ($Name + '-runtime.log')) -Force }
 }
 
+function Save-FailedCreate {
+    # Keeps the evidence of a create that failed: the sandbox's whole logs\ directory and the
+    # create's own output (with --debug, the host-side trace), and prints one classifying line.
+    param([string]$Name, [string]$CreateText)
+    $src = Join-Path $MsbHome ('sandboxes\' + $Name + '\logs')
+    $dst = Join-Path $LogDir ('sandboxes\' + $Name)
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $dst 'create-output.txt'), $CreateText)
+    if (Test-Path $src) { Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force }
+    $rt = Join-Path $dst 'runtime.log'
+    $kl = Join-Path $dst 'kernel.log'
+    $polls = 0; $vmmStop = 0; $exitCode = ''; $reason4 = 0; $rtBytes = -1; $klBytes = -1
+    if (Test-Path $rt) {
+        $rtBytes = (Get-Item $rt).Length
+        $polls = @(Select-String -Path $rt -Pattern 'read data offset from index=c\b').Count
+        $vmmStop = @(Select-String -Path $rt -Pattern 'Vmm is stopping').Count
+        $reason4 = @(Select-String -Path $rt -Pattern 'unhandled reason 4').Count
+        $m = Select-String -Path $rt -Pattern 'using vcpu exit code: (\S+)' | Select-Object -Last 1
+        if ($m) { $exitCode = $m.Matches[0].Groups[1].Value }
+    }
+    if (Test-Path $kl) { $klBytes = (Get-Item $kl).Length }
+    $kind = 'other'
+    if ($polls -ge 80 -and $klBytes -le 0) { $kind = 'timer-check-panic' }
+    elseif ($klBytes -gt 0) { $kind = 'guest-console-up' }
+    Write-Output ('  boot-evidence ' + $Name + ': kind=' + $kind + ' rtc-c-polls=' + $polls + ' kernel.log=' + $klBytes +
+        'B runtime.log=' + $rtBytes + 'B vmm-stopping=' + $vmmStop + ' vcpu-exit-code=' + $exitCode +
+        ' unhandled-reason-4=' + $reason4 + ' (kept in ' + $dst + ')')
+    if (Test-Path $kl) {
+        Write-Output '  --- kernel.log (last 15 lines)'
+        Get-Content -Path $kl | Select-Object -Last 15 | ForEach-Object { Write-Output ('      ' + $_) }
+    }
+    if (Test-Path $rt) {
+        Write-Output '  --- runtime.log (last 15 lines)'
+        Get-Content -Path $rt | Select-Object -Last 15 | ForEach-Object { Write-Output ('      ' + $_) }
+    }
+}
+
 function Remove-Sandbox {
     param([string]$Name)
     Save-RuntimeLog $Name
@@ -162,9 +211,10 @@ function New-AlpineSandbox {
     # Creates the sandbox and authorizes the ssh key; prints both. Returns nothing: callers check
     # $script:CreateOk (a return value would be mixed with the printed lines).
     param([string]$Name)
-    $r = Invoke-Msb @('create', 'alpine', '--name', $Name, '--replace')
-    Show ('msb create ' + $Name) $r
+    $r = Invoke-Msb @('--debug', 'create', 'alpine', '--name', $Name, '--replace')
+    Show ('msb create ' + $Name) @{ Code = $r.Code; Text = $(if ($r.Code -eq 0) { '' } else { $r.Text }) }
     $script:CreateOk = ($r.Code -eq 0)
+    if (-not $script:CreateOk) { Save-FailedCreate $Name $r.Text }
     Initialize-Key
 }
 
@@ -181,7 +231,7 @@ function Test-Relay {
     $r = Invoke-Msb @('create', '--name', $name, '--replace', '--cpus', '2', '--memory', '1024',
         '--mount-dir', (Q ($guestDir + ':/opt/repro:ro')), 'python:3.12-alpine')
     Show ('msb create ' + $name) $r
-    if ($r.Code -ne 0) { Fail 'relay' 'precondition: create failed'; return }
+    if ($r.Code -ne 0) { Save-FailedCreate $name $r.Text; Fail 'relay' 'precondition: create failed'; return }
     $r = Invoke-Msb @('exec', '--no-tty', '--no-stdin', $name, '--', 'sh', '-c',
         (Q ('nohup python3 /opt/repro/guest-server.py 18090 ' + $MaxMs + ' >/tmp/srv.log 2>&1 &')))
     Show 'guest server start' $r
@@ -343,10 +393,10 @@ function Test-Wedge {
     New-Item -ItemType Directory -Force -Path $guestDir | Out-Null
     $py = [System.IO.File]::ReadAllText((Join-Path $Here 'guest-server.py'))
     [System.IO.File]::WriteAllText((Join-Path $guestDir 'guest-server.py'), ($py -replace "`r`n", "`n"))
-    $r = Invoke-Msb @('create', '--name', $name, '--replace', '--cpus', '2', '--memory', '1024',
+    $r = Invoke-Msb @('--debug', 'create', '--name', $name, '--replace', '--cpus', '2', '--memory', '1024',
         '--mount-dir', (Q ($guestDir + ':/opt/repro:ro')), 'python:3.12-alpine')
-    Show ('msb create ' + $name) $r
-    if ($r.Code -ne 0) { Fail 'wedge' 'precondition: create failed'; return }
+    Show ('msb create ' + $name) @{ Code = $r.Code; Text = $(if ($r.Code -eq 0) { '' } else { $r.Text }) }
+    if ($r.Code -ne 0) { Save-FailedCreate $name $r.Text; Fail 'wedge' 'precondition: create failed'; return }
     $r = Invoke-Msb @('exec', '--no-tty', '--no-stdin', $name, '--', 'sh', '-c',
         (Q ('nohup python3 /opt/repro/guest-server.py 18090 ' + $MaxMs + ' >/tmp/srv.log 2>&1 &')))
     Show 'guest server start' $r
@@ -384,8 +434,11 @@ function Test-Wedge {
 
 function Test-Boot {
     $n = $BootRounds * $BootPar
-    Write-Output ('=== boot: ' + $BootRounds + ' rounds x ' + $BootPar + ' concurrent creates must all boot')
-    Show 'msb pull alpine' (Invoke-Msb @('pull', 'alpine'))
+    $shape = $BootImage + ', ' + $BootCpus + ' vCPU' + $(if ($BootMemory -gt 0) { ', ' + $BootMemory + ' MiB' } else { '' })
+    Write-Output ('=== boot: ' + $BootRounds + ' rounds x ' + $BootPar + ' concurrent creates must all boot (' + $shape + ')')
+    Show ('msb pull ' + $BootImage) (Invoke-Msb @('pull', $BootImage))
+    $res = ' --cpus ' + $BootCpus
+    if ($BootMemory -gt 0) { $res += ' --memory ' + $BootMemory }
     $ok = 0
     $failed = @()
     for ($round = 1; $round -le $BootRounds; $round++) {
@@ -397,7 +450,7 @@ function Test-Boot {
             $out = Join-Path $OutDir ($name + '.txt')
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
-            $psi.Arguments = '/c ""' + $Msb + '" create alpine --name ' + $name + ' --replace > "' + $out + '" 2>&1 < NUL"'
+            $psi.Arguments = '/c ""' + $Msb + '" --debug create ' + $BootImage + ' --name ' + $name + $res + ' --replace > "' + $out + '" 2>&1 < NUL"'
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
             $runs += [pscustomobject]@{ Name = $name; Out = $out; P = [System.Diagnostics.Process]::Start($psi) }
@@ -414,19 +467,19 @@ function Test-Boot {
                 $failed += $r.Name
                 $line += ('FAIL ' + $ms + 'ms')
                 Write-Output ('  ' + $r.Name + ': exit ' + $code)
-                $text -split "`n" | ForEach-Object { Write-Output ('      ' + $_.TrimEnd()) }
-                if ($failed.Count -eq 1) {
-                    $log = Join-Path $MsbHome ('sandboxes\' + $r.Name + '\logs\runtime.log')
-                    if (Test-Path $log) {
-                        Write-Output '  --- runtime.log (first failure, last lines)'
-                        Get-Content -Path $log | Select-Object -Last 8 | ForEach-Object { Write-Output ('      ' + $_) }
-                    }
-                }
+                $text -split "`n" | Where-Object { $_ -match 'error|exited|relay' } | Select-Object -Last 6 |
+                    ForEach-Object { Write-Output ('      ' + $_.TrimEnd()) }
+                Save-FailedCreate $r.Name $text
             }
         }
         Write-Output ('round ' + $round + ': ' + ($line -join ', '))
-        foreach ($r in $runs) { Remove-Sandbox $r.Name }
+        # Logs of good boots are not kept (debug runtime.logs add up over hundreds of boots).
+        foreach ($r in $runs) {
+            Invoke-Msb @('stop', $r.Name) 120 | Out-Null
+            Invoke-Msb @('rm', '-f', $r.Name) 120 | Out-Null
+        }
     }
+    Write-Output ('boot-summary: shape=' + $shape + ' par=' + $BootPar + ' boots=' + $n + ' failed=' + $failed.Count)
     if ($failed.Count -gt 0) { Fail 'boot' ($failed.Count.ToString() + ' of ' + $n + ' creates did not boot (' + ($failed -join ', ') + ')'); return }
     Pass 'boot' ('all ' + $n + ' creates booted, ' + $BootPar + ' at a time')
 }
