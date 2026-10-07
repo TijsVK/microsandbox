@@ -3,8 +3,8 @@
 #
 # Each case is the repro from puddle's upstream-issues/msb-* folder turned into a pass/fail test.
 # A case PASSES when msb behaves as fixed and FAILS (with the evidence lines) when the bug shows.
-# Stock msb v0.7.7 fails all seven; v0.7.7-puddle.2 passes the first five, v0.7.7-puddle.3 the first
-# six, v0.7.7-puddle.4 and later all seven.
+# Stock msb v0.7.7 fails the first seven; v0.7.7-puddle.2 passes the first five, v0.7.7-puddle.3 the
+# first six, v0.7.7-puddle.4 to .7 the first seven, v0.7.7-puddle.8 and later all eight.
 #
 #   relay      closing ssh -L channels while the guest closes the same TCP connections must not
 #              stop the VM ("cross-lane merge failed: bulk finish arrived before acceptance").
@@ -24,6 +24,13 @@
 #              upstream-issues/msb-windows-boot-race). -BootCpus/-BootMemory/-BootImage pick the
 #              guest; the defaults (1 vCPU, alpine) are the T-096 case. -BootCpus 2 is the shape of the
 #              residual early exits T-164 chases.
+#   boot-smp   the boot case with 2 vCPUs and 1024 MiB. About 3% of such boots lost PID 1 before
+#              the relay (stock -puddle.7: 34 of 1200 on windows-2025 at 6 concurrent): when the
+#              virtio-console port arrived after the kernel's console_on_rootfs(), agentd started
+#              without stdio, found no /dev/null in the Windows bootstrap root and Rust's runtime
+#              aborted (fork fix: bootstrap root gets the unix mountpoints, dev first; puddle
+#              upstream-issues/msb-windows-bootstrap-root-dev). Not deterministic: a stock build
+#              fails one 60-boot run with ~84% probability; bootstrap_fs unit tests are the exact check.
 #
 # Evidence: creates in the boot, wedge and alpine cases run as `msb --debug create`, so the create's
 # output has the host-side SDK trace and runtime.log the VMM's debug trace (the guest's CMOS/RTC port
@@ -39,7 +46,7 @@
 #
 # usage:
 #   powershell -ExecutionPolicy Bypass -File repros.ps1 -Msb <msb.exe> [-Libkrunfw <libkrunfw.dll>]
-#       [-Case relay,signal,scp,forward,stale-dir,wedge,boot] [-Work <dir>] [-Prefix pr] [-Rounds 10]
+#       [-Case relay,signal,scp,forward,stale-dir,wedge,boot,boot-smp] [-Work <dir>] [-Prefix pr] [-Rounds 10]
 #       [-BootRounds 10] [-BootPar 6] [-BootCpus 1] [-BootMemory 0] [-BootImage alpine]
 #       [-KeepGoodBoots 0] [-KernelCmdline '<extra guest cmdline, via MSB_KRUN_KERNEL_CMDLINE>']
 #       [-AgentdPath <agentd to boot instead of the embedded one, via MSB_AGENTD_PATH>]
@@ -51,7 +58,7 @@
 param(
     [Parameter(Mandatory = $true)] [string]$Msb,
     [string]$Libkrunfw = '',
-    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot'),
+    [string[]]$Case = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp'),
     [string]$Work = '',
     [string]$Prefix = 'pr',
     [int]$Rounds = 10,
@@ -73,7 +80,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot')
+$AllCases = @('relay', 'signal', 'scp', 'forward', 'stale-dir', 'wedge', 'boot', 'boot-smp')
 # -Case a,b arrives as one string when the script is started with -File.
 $Case = @($Case | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 foreach ($c in $Case) {
@@ -527,6 +534,7 @@ foreach ($c in $Case) {
         'stale-dir' { Test-StaleDir }
         'wedge' { Test-Wedge }
         'boot' { Test-Boot }
+        'boot-smp' { $script:BootCpus = 2; if ($BootMemory -le 0) { $script:BootMemory = 1024 }; Test-Boot }
     }
     Write-Output ('  (' + $c + ' took ' + [int]$t.Elapsed.TotalSeconds + ' s)')
 }
