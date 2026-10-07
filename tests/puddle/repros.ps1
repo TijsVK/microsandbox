@@ -41,6 +41,7 @@
 #   powershell -ExecutionPolicy Bypass -File repros.ps1 -Msb <msb.exe> [-Libkrunfw <libkrunfw.dll>]
 #       [-Case relay,signal,scp,forward,stale-dir,wedge,boot] [-Work <dir>] [-Prefix pr] [-Rounds 10]
 #       [-BootRounds 10] [-BootPar 6] [-BootCpus 1] [-BootMemory 0] [-BootImage alpine]
+#       [-KeepGoodBoots 0] [-KernelCmdline '<extra guest cmdline, via MSB_KRUN_KERNEL_CMDLINE>']
 #       [-Node node] [-OpenSsh <dir with ssh.exe, scp.exe, ssh-keygen.exe>] [-LocalPort 18190]
 # Exit code: 0 when every case passed, 1 when one failed, 2 on bad usage.
 # Nothing is deleted: the script prints the work dir to remove when done.
@@ -61,6 +62,8 @@ param(
     [int]$BootCpus = 1,
     [int]$BootMemory = 0,
     [string]$BootImage = 'alpine',
+    [int]$KeepGoodBoots = 0,
+    [string]$KernelCmdline = '',
     [string]$Node = 'node',
     [string]$OpenSsh = (Join-Path $env:SystemRoot 'System32\OpenSSH')
 )
@@ -83,6 +86,8 @@ New-Item -ItemType Directory -Force -Path $MsbHome, $OutDir, $LogDir | Out-Null
 $env:MSB_HOME = $MsbHome
 $env:MSB_PATH = $Msb
 if ($Libkrunfw -ne '') { $env:MSB_LIBKRUNFW_PATH = (Resolve-Path -LiteralPath $Libkrunfw).Path }
+# libkrun appends this to the guest command line (a debug hatch, e.g. 'loglevel=8' for a full kernel.log).
+if ($KernelCmdline -ne '') { $env:MSB_KRUN_KERNEL_CMDLINE = $KernelCmdline }
 $NodeExe = (Get-Command $Node -ErrorAction SilentlyContinue).Source
 $script:Failed = @()
 $script:Passed = @()
@@ -441,6 +446,7 @@ function Test-Boot {
     if ($BootMemory -gt 0) { $res += ' --memory ' + $BootMemory }
     $ok = 0
     $failed = @()
+    $script:GoodKept = 0
     for ($round = 1; $round -le $BootRounds; $round++) {
         # Start every create of the round at once, each through cmd.exe with its output in a file
         # (no pipes, see Invoke-Native), then wait for all of them.
@@ -461,7 +467,17 @@ function Test-Boot {
                 $code = $r.P.ExitCode
                 $ms = [int]($r.P.ExitTime - $r.P.StartTime).TotalMilliseconds
             }
-            if ($code -eq 0) { $ok++; $line += ('ok ' + $ms + 'ms') } else {
+            if ($code -eq 0) {
+                $ok++; $line += ('ok ' + $ms + 'ms')
+                if ($script:GoodKept -lt $KeepGoodBoots) {
+                    # A good boot's logs, to compare a failure against.
+                    $script:GoodKept++
+                    $src = Join-Path $MsbHome ('sandboxes\' + $r.Name + '\logs')
+                    $dst = Join-Path $LogDir ('good\' + $r.Name)
+                    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+                    if (Test-Path $src) { Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force }
+                }
+            } else {
                 $text = ''
                 if (Test-Path $r.Out) { $text = (Get-Content -Encoding UTF8 -Path $r.Out | Out-String).Trim() }
                 $failed += $r.Name
@@ -487,7 +503,7 @@ function Test-Boot {
 # ------------------------------------------------------------------------------------------- main
 Write-Output ('msb: ' + $Msb)
 Show 'msb --version' (Invoke-Msb @('--version'))
-Write-Output ('MSB_HOME: ' + $MsbHome + '; cases: ' + ($Case -join ', '))
+Write-Output ('MSB_HOME: ' + $MsbHome + '; cases: ' + ($Case -join ', ') + $(if ($KernelCmdline -ne '') { '; MSB_KRUN_KERNEL_CMDLINE=' + $KernelCmdline } else { '' }))
 $t0 = [Diagnostics.Stopwatch]::StartNew()
 foreach ($c in $Case) {
     $t = [Diagnostics.Stopwatch]::StartNew()
