@@ -49,7 +49,7 @@ on:
         default: "0"
         type: string
       image:
-        description: "Guest image"
+        description: "Guest image, or probe for puddle doctor's test boot (fresh bind root, msb run)"
         required: true
         default: alpine
         type: string

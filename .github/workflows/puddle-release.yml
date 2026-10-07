@@ -242,8 +242,10 @@ jobs:
           Copy-Item upstream\libkrunfw-windows-x86_64.dll runtime\libkrunfw.dll -Force
 
       # The Windows-only bootstrap root (crates/runtime/lib/runner/bootstrap_fs.rs) has no other CI:
-      # its mountpoints keep PID 1 alive when the kernel starts it without a console (T-164).
-      - name: Runtime bootstrap-root tests (Windows-only module)
+      # its mountpoints keep PID 1 alive when the kernel starts it without a console (T-164). The
+      # bind_rootfs tests check the same /dev for host-directory roots on the Windows file system
+      # (T-209).
+      - name: Runtime bootstrap-root and bind-root tests
         shell: pwsh
         env:
           RUSTFLAGS: -C target-feature=+crt-static
@@ -253,8 +255,8 @@ jobs:
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture amd64 -HostArchitecture amd64
           cargo test --locked --release --no-default-features --features embed-binaries,net,runner `
-            -p microsandbox-runtime --lib --target $env:RUST_TARGET -- bootstrap_fs
-          if ($LASTEXITCODE -ne 0) { throw "bootstrap_fs tests failed" }
+            -p microsandbox-runtime --lib --target $env:RUST_TARGET -- bootstrap_fs bind_rootfs
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap_fs / bind_rootfs tests failed" }
 
       - name: Embedded agentd is upstream's
         shell: pwsh
