@@ -26,6 +26,8 @@ pick      | fix(runtime): forward a bulk terminal that no finish will follow    
 pick      | feat(image): add a proxy option to the registry client                  | msb-registry-proxy-option               | -
 pick      | fix(runtime): give the Windows bootstrap root the unix mountpoints      | msb-windows-bootstrap-root-dev          | -
 pick      | fix(runtime): give a bind rootfs a /dev before the guest boots          | msb-bind-rootfs-dev                     | -
+pick      | fix(runtime): raise the per-client forward limit from 64 to 256         | msb-forward-cap-retry                   | -
+pick      | fix(ssh): retry a forward refused for the per-client limit              | msb-forward-cap-retry                   | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
