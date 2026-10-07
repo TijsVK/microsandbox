@@ -58,6 +58,11 @@ on:
         required: false
         default: ""
         type: string
+      agentd_tag:
+        description: "Release on this repo whose agentd-x86_64 asset replaces the embedded agentd (diagnostics)"
+        required: false
+        default: ""
+        type: string
       keep_good:
         description: "Good boots per shard whose logs are kept for comparison"
         required: false
@@ -97,6 +102,17 @@ jobs:
           bash "$v" dl/checksums.sha256 dl/msb-windows-x86_64.exe msb-windows-x86_64.exe
           bash "$v" dl/checksums.sha256 dl/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
 
+      - name: Diagnostic agentd from ${{ inputs.agentd_tag }}
+        if: inputs.agentd_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.agentd_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D agentd-dl -p agentd-x86_64
+          sha256sum agentd-dl/agentd-x86_64
+
       - name: Install layout
         shell: pwsh
         run: |
@@ -124,6 +140,7 @@ jobs:
           $extra = @()
           # An empty argument would reach powershell -File as a missing value.
           if ($env:CMDLINE -ne '') { $extra = @('-KernelCmdline', $env:CMDLINE) }
+          if (Test-Path agentd-dl\agentd-x86_64) { $extra += @('-AgentdPath', "$PWD\agentd-dl\agentd-x86_64") }
           ./tests/puddle/run-outside-job.ps1 -Script tests/puddle/repros.ps1 -Log "$w-log/repros.log" -TimeoutSec 3300 -- `
             -Msb "$PWD\runtime\msb.exe" -Libkrunfw "$PWD\runtime\libkrunfw.dll" -Case boot -Work $w `
             -Prefix "s$env:SHARD" -BootRounds $env:ROUNDS -BootPar $env:PAR -BootCpus $env:CPUS `
