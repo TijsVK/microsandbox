@@ -88,6 +88,7 @@ jobs:
       version: ${{ steps.tags.outputs.version }}
       upstream_tag: ${{ steps.tags.outputs.upstream_tag }}
       prev_tag: ${{ steps.prev.outputs.prev_tag }}
+      skip: ${{ steps.tags.outputs.skip }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -107,6 +108,14 @@ jobs:
             TAG=$GITHUB_REF_NAME
           else
             TAG=$(git describe --tags --match 'v*-puddle.*' --abbrev=0 HEAD)
+            # A version commit is pushed just before its tag. If the tag is not there yet, this run
+            # would rebuild the previous tag and report that tag's result against the new commit;
+            # the tag's own run gates the new version.
+            head_version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
+            if [ "v$head_version" != "$TAG" ]; then
+              echo "::notice::branch push: HEAD is version $head_version, newest reachable tag is $TAG; the v$head_version tag run tests it, skipping"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
             echo "branch push: checking the newest reachable fork tag $TAG (no publish)"
           fi
           if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-puddle\.[1-9][0-9]*$ ]]; then
@@ -168,6 +177,7 @@ jobs:
   build-agentd:
     name: Build agentd (x86_64-linux-musl)
     needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -377,6 +387,7 @@ jobs:
   test-windows:
     name: Patched crates, Windows tests (windows-2025)
     needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
