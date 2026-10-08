@@ -239,3 +239,7 @@ msb_krun_vmm = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
 # session wedge when the peer closes a channel with queued data. One branch per
 # russh base version; move to a new `puddle-<version>` branch when the lock moves.
 russh = { git = "https://github.com/TijsVK/russh", branch = "puddle-0.63.3" }
+# puddle fork: msb-imago 0.1.7 (the release Cargo.lock resolves) plus `File::sync()` calling
+# fdatasync instead of fsync, so a guest flush no longer commits the host filesystem journal for
+# the image's mtime. One tag per base version; replay.py stops when the release moves msb-imago.
+msb-imago = { git = "https://github.com/TijsVK/imago", tag = "v0.1.7-puddle.1" }

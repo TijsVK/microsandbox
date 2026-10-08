@@ -4368,8 +4368,7 @@ dependencies = [
 [[package]]
 name = "msb-imago"
 version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b6feac477a4387d62fde89aad52900fa0ea7ccb4fec686f50b93a575cbf0ea5"
+source = "git+https://github.com/TijsVK/imago?tag=v0.1.7-puddle.1#e528d65caf49ed0e117eb29ffae1d9e6efc95d25"
 dependencies = [
  "async-trait",
  "cfg-if",
