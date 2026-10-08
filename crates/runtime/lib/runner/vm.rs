@@ -4601,6 +4601,24 @@ mod tests {
         assert_eq!(got, want);
     }
 
+    /// What the child of the rotation test wrote to stderr besides its filler lines (its panic
+    /// message, for one): after `setup_log_capture` that is in `runtime.log*`, not in the pipe
+    /// the parent reads.
+    fn child_stderr(dir: &Path) -> String {
+        let mut text = String::new();
+        for name in ["runtime.log.2", "runtime.log.1", "runtime.log"] {
+            let Ok(bytes) = std::fs::read(dir.join(name)) else {
+                continue;
+            };
+            text += &format!("--- {name}, {} bytes, other than filler:\n", bytes.len());
+            let filler = |line: &&[u8]| line.is_empty() || line.iter().all(|b| *b == b'x');
+            for line in bytes.split(|b| *b == b'\n').filter(|l| !filler(l)).take(40) {
+                text += &format!("{}\n", String::from_utf8_lossy(line));
+            }
+        }
+        text
+    }
+
     /// Writes 11 MiB to the real stderr of a process that ran `setup_log_capture`, and checks
     /// that `runtime.log` rotated at 10 MiB. Runs on every OS: the redirect is the part that differs.
     #[test]
@@ -4619,10 +4637,12 @@ mod tests {
             .unwrap();
         assert!(
             out.status.success(),
-            "child failed: {}\n{}\n{}",
+            "child failed: {}\n{}\n{}\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
-            std::fs::read_to_string(dir.path().join("child-error.txt")).unwrap_or_default()
+            std::fs::read_to_string(dir.path().join("child-error.txt"))
+                .unwrap_or_else(|e| format!("no child-error.txt: {e}")),
+            child_stderr(dir.path())
         );
 
         let len = |name: &str| std::fs::metadata(dir.path().join(name)).map(|m| m.len());
