@@ -340,7 +340,7 @@ jobs:
           . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
           Set-MsvcEnvironment -Architecture amd64 -HostArchitecture amd64
           cargo test --locked --release --no-default-features --features embed-binaries,net,runner `
-            -p microsandbox-runtime --lib --target $env:RUST_TARGET -- bootstrap_fs bind_rootfs log_thread stderr_capture
+            -p microsandbox-runtime --lib --target $env:RUST_TARGET -- bootstrap_fs bind_rootfs log_thread stderr_capture runner::logging
           if ($LASTEXITCODE -ne 0) { throw "bootstrap_fs / bind_rootfs / log-rotation tests failed" }
 
       - name: Embedded agentd is this run's
