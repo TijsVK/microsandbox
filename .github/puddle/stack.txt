@@ -30,6 +30,7 @@ pick      | fix(runtime): raise the per-client forward limit from 64 to 256     
 pick      | fix(ssh): retry a forward refused for the per-client limit              | msb-forward-cap-retry                   | -
 pick      | fix(runtime): rotate runtime.log on Windows like on Unix                | msb-windows-log-rotation                | -
 pick      | test(runtime): size the log files by path in the rotation test          | msb-windows-log-rotation                | -
+pick      | test(runtime): show the child's stderr when the rotation test fails     | msb-windows-log-rotation                | -
 pick      | fix(image): retry transient registry failures and report a failed token request | msb-registry-transient-retry | -
 pick      | fix(sdk): start the sandbox process in a session and console of its own | msb-console-isolation | -
 version   | build: version the puddle fork as*                                      | -                                       | -
