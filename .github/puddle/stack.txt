@@ -35,3 +35,4 @@ version   | build: version the puddle fork as*                                  
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
 russh     | build: use the puddle russh fork*                                       | russh-peer-close-pending-data-wedge     | -
+imago     | build: use the puddle imago fork*                                       | msb-guest-fsync-latency                 | -
