@@ -5,15 +5,24 @@
 # tests/puddle/vsock-tail.sh against it in a real microVM. The same cases also run against
 # upstream's stock release as a control (msb_krun 0.1.40 on v0.7.7: no libkrun #152).
 #
+# A libkrun change can also be tried by pushing a vsock-tail/<name> branch whose Cargo.toml and
+# Cargo.lock point at it.
+#
 #   gh workflow run puddle-vsock-tail.yml -R TijsVK/microsandbox --ref <branch> \
 #     [-f libkrun_rev=<sha>] [-f stock_tag=v0.7.7] [-f cases='h2g-close 1000 1048576']
 name: puddle vsock tail
 
 on:
+  # On `puddle` (and vsock-tail/* experiment branches): when the test or the lock (a libkrun bump)
+  # changes.
   push:
+    branches:
+      - puddle
+      - vsock-tail/**
     paths:
       - .github/workflows/puddle-vsock-tail.yml
       - tests/puddle/vsock-tail.*
+      - Cargo.lock
   workflow_dispatch:
     inputs:
       libkrun_rev:
