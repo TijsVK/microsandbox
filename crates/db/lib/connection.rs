@@ -85,11 +85,13 @@ impl DbReadConnection {
             .read_only(true)
             .create_if_missing(false)
             .busy_timeout(busy_timeout);
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(connect_timeout)
-            .connect_with(options)
-            .await?;
+        let pool = pool::retry_transient_io(pool::CONNECT_RETRY_DELAYS, || {
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(connect_timeout)
+                .connect_with(options.clone())
+        })
+        .await?;
         Ok(Self(sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(
             pool,
         )))
