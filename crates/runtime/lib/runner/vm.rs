@@ -3410,11 +3410,25 @@ fn read_parent_watchdog_signal(file: &mut std::fs::File) -> std::io::Result<Pare
 /// stdout/stderr saved before redirect).
 fn spawn_log_thread(
     name: &str,
+    reader: impl std::io::Read + Send + 'static,
+    log_dir: &std::path::Path,
+    log_prefix: &str,
+    max_bytes: u64,
+    forward: Option<std::fs::File>,
+) -> RuntimeResult<()> {
+    spawn_log_thread_with_retry(name, reader, log_dir, log_prefix, max_bytes, forward, None)
+}
+
+/// [`spawn_log_thread`] with the wait between rotation attempts after a failure
+/// (`None`: the default).
+fn spawn_log_thread_with_retry(
+    name: &str,
     mut reader: impl std::io::Read + Send + 'static,
     log_dir: &std::path::Path,
     log_prefix: &str,
     max_bytes: u64,
     forward: Option<std::fs::File>,
+    retry_interval: Option<Duration>,
 ) -> RuntimeResult<()> {
     use crate::logging::RotatingLog;
 
@@ -3431,6 +3445,9 @@ fn spawn_log_thread(
                     return;
                 }
             };
+            if let Some(interval) = retry_interval {
+                log.set_retry_interval(interval);
+            }
             let mut fwd = forward;
             let mut buf = [0u8; 4096];
             loop {
@@ -3441,6 +3458,17 @@ fn spawn_log_thread(
                         if let Some(ref mut f) = fwd {
                             let _ = std::io::Write::write_all(f, &buf[..n]);
                         }
+                        // The report goes straight into the log (and the
+                        // forwarded copy), not to stderr: stderr is the pipe
+                        // this thread drains, so writing to it from here
+                        // could block on a full pipe.
+                        if let Some(event) = log.take_rotation_event() {
+                            let line = rotation_notice(&log_prefix, &event);
+                            let _ = log.write_notice(&line);
+                            if let Some(ref mut f) = fwd {
+                                let _ = writeln!(f, "{line}");
+                            }
+                        }
                     }
                     Err(_) => break,
                 }
@@ -3449,6 +3477,22 @@ fn spawn_log_thread(
         .map_err(|e| RuntimeError::Custom(format!("spawn {name} thread: {e}")))?;
 
     Ok(())
+}
+
+/// The line the log thread writes when a rotation step fails, or when a
+/// rotation works again after a failure.
+fn rotation_notice(log_prefix: &str, event: &crate::logging::RotationEvent) -> String {
+    use crate::logging::RotationEvent;
+
+    match event {
+        RotationEvent::Failed(err) => format!(
+            "puddle: cannot rotate the {log_prefix} log ({err}); \
+             the log keeps growing past its limit and the rotation is retried"
+        ),
+        RotationEvent::Recovered => {
+            format!("puddle: the {log_prefix} log rotates again after an earlier failure")
+        }
+    }
 }
 
 /// Parsed `--mount` spec: tag, host path, plus optional policies.
@@ -4563,6 +4607,84 @@ mod tests {
             "t.log.3"
         );
         assert!(!dir.path().join("t.log.5").exists());
+    }
+
+    /// A rotation step fails because another program holds `runtime.log` (Windows: open without
+    /// delete sharing) or its directory is read-only (Unix): the thread reports once in the log,
+    /// keeps writing, loses no older log, and rotates when the obstacle is gone.
+    #[test]
+    fn test_log_thread_reports_a_failed_rotation_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        super::spawn_log_thread_with_retry(
+            "log-test",
+            reader,
+            dir.path(),
+            "t",
+            100,
+            None,
+            Some(Duration::from_millis(50)),
+        )
+        .unwrap();
+        let read = |name: &str| std::fs::read(dir.path().join(name)).unwrap_or_default();
+        let wait_for = |what: &str, ok: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !ok() {
+                assert!(std::time::Instant::now() < deadline, "never: {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // Two older logs, then the file that gets blocked.
+        for c in *b"abc" {
+            writer.write_all(&[c; 80]).unwrap();
+            wait_for("chunk lands", &|| read("t.log").ends_with(&[c; 80]));
+        }
+        assert_eq!(read("t.log.1"), [b'b'; 80]);
+        assert_eq!(read("t.log.2"), [b'a'; 80]);
+
+        let Some(blocker) =
+            crate::runner::logging::test_support::RotationBlocker::new(&dir.path().join("t.log"))
+        else {
+            eprintln!("cannot block renames here (root?); skipped");
+            return;
+        };
+        for _ in 0..4 {
+            writer.write_all(&[b'd'; 80]).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        wait_for("failure report", &|| {
+            String::from_utf8_lossy(&read("t.log")).contains("cannot rotate the t log")
+        });
+        // Give the later chunks time to land, then count.
+        wait_for("all chunks", &|| {
+            read("t.log")
+                .windows(80)
+                .filter(|w| *w == [b'd'; 80])
+                .count()
+                >= 4
+        });
+        let text = String::from_utf8_lossy(&read("t.log")).into_owned();
+        assert_eq!(text.matches("cannot rotate the t log").count(), 1, "{text}");
+        assert!(
+            text.contains(&"c".repeat(80)),
+            "the blocked file kept its content"
+        );
+        assert_eq!(read("t.log.1"), [b'b'; 80]);
+        assert_eq!(read("t.log.2"), [b'a'; 80]);
+        assert!(!dir.path().join("t.log.3").exists());
+
+        drop(blocker);
+        std::thread::sleep(Duration::from_millis(80));
+        writer.write_all(&[b'e'; 80]).unwrap();
+        wait_for("rotation after the obstacle is gone", &|| {
+            String::from_utf8_lossy(&read("t.log")).contains("the t log rotates again")
+        });
+        wait_for("t.log.1 holds the blocked file", &|| {
+            String::from_utf8_lossy(&read("t.log.1")).contains("cannot rotate the t log")
+        });
+        assert_eq!(read("t.log.2"), [b'b'; 80]);
+        assert_eq!(read("t.log.3"), [b'a'; 80]);
     }
 
     const CAPTURE_DIR_ENV: &str = "MSB_TEST_STDERR_CAPTURE_DIR";
