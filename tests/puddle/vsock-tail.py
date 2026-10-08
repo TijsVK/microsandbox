@@ -15,6 +15,7 @@
 #               (0 = as fast as it can) and logs the result
 # guest options: rate=<B/s> (host read rate, g2h), delay=<s> (guest waits before its first read,
 # h2g), grate=<B/s> (guest read rate, h2g), chunk=<B> (guest send size, g2h), port=<vsock port>,
+# gbuf=<B> (guest vsock buffer for g2h, default 16 MiB; 0 keeps the kernel's 256 KiB),
 # unix=<path> (connect to a Unix socket instead of vsock: a self-test of this script without a VM).
 # The guest prints one JSON line per short or bad connection and a final "SUMMARY {...}" line;
 # the host appends one JSON line per g2h connection to <results file>.
@@ -135,6 +136,7 @@ def guest(case, count, size, opts):
     delay = float(opts.get("delay", 0))
     grate = float(opts.get("grate", 0))
     chunk = int(opts.get("chunk", 2048))
+    gbuf = int(opts.get("gbuf", 16 << 20))
     short = bad = errors = lost = 0
     t0 = time.monotonic()
     for i in range(count):
@@ -143,11 +145,11 @@ def guest(case, count, size, opts):
             s.connect(opts["unix"])
         else:
             s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-        if case == "g2h-close" and "unix" not in opts:
+        if case == "g2h-close" and gbuf and "unix" not in opts:
             # As in the earlier Windows runs: a large guest buffer keeps the 256 KiB credit stall
             # of older runtimes out of the way, so only the close path is measured.
-            s.setsockopt(socket.AF_VSOCK, socket.SO_VM_SOCKETS_BUFFER_MAX_SIZE, 16 << 20)
-            s.setsockopt(socket.AF_VSOCK, socket.SO_VM_SOCKETS_BUFFER_SIZE, 16 << 20)
+            s.setsockopt(socket.AF_VSOCK, socket.SO_VM_SOCKETS_BUFFER_MAX_SIZE, gbuf)
+            s.setsockopt(socket.AF_VSOCK, socket.SO_VM_SOCKETS_BUFFER_SIZE, gbuf)
         if "unix" not in opts:
             s.connect((2, port))
         s.sendall(("%s %d %d %s\n" % (case, size, i, rate)).encode())

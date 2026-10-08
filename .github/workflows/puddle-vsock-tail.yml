@@ -190,7 +190,8 @@ jobs:
           CASES: ${{ inputs.cases }}
           VSOCK_TAIL_NAME: tail-${{ matrix.runtime }}
         run: |
-          set -uo pipefail
+          # Not -e (the shell's default here): the exit code is judged below.
+          set +e -uo pipefail
           chmod +x rt/msb
           cases=()
           if [ -n "$CASES" ]; then
