@@ -450,6 +450,14 @@ jobs:
           git -C libkrun checkout -q FETCH_HEAD
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
+      # Guest journal fix (image): a new upper or volume image has real bytes over its 64 MiB journal,
+      # checked with the allocated ranges NTFS reports; a rootfs artifact stays sparse (the control).
+      - name: microsandbox-image ext4 tests (the journal range holds data)
+        shell: pwsh
+        run: |
+          cargo test --locked -p microsandbox-image --lib ext4:: -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-image ext4 tests failed" }
+
       # libkrun fixes: credit stall + tail-loss shutdown order (vsock), unplug zero-fill (mem, Windows-only tests).
       - name: msb_krun_devices tests
         shell: pwsh
@@ -543,10 +551,12 @@ jobs:
           echo "MSB_EMBED_ARTIFACTS_DIR=$e" >> "$GITHUB_ENV"
 
       # relay crash fix (runtime), forward limit (protocol, runtime), stale dir + ssh fixes (SDK), ssh
-      # fixes (CLI).
+      # fixes (CLI), guest journal fix (image formatter; the SDK lib tests cover the sandbox root and
+      # disk volume paths).
       - name: msb lib tests
         run: |
           set -euo pipefail
+          cargo test --locked -p microsandbox-image --lib ext4::
           cargo test --locked -p microsandbox-protocol --lib
           cargo test --locked -p microsandbox-runtime --lib
           cargo test --locked -p microsandbox --features ssh --lib
