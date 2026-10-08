@@ -41,6 +41,8 @@ g2h-close 1000 1048576
 g2h-close 200 4096
 g2h-close 5 8388608 rate=3200000
 g2h-close 3 8388608 rate=400000
+g2h-close 200 1048576 gbuf=0
+g2h-close 3 8388608 rate=3200000 gbuf=0
 EOF
 }
 
