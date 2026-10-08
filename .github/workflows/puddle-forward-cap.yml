@@ -1,5 +1,5 @@
 # puddle fork: more than 64 concurrent forwards on one ssh session, on a hosted Linux runner with KVM
-# (puddle T-121). Fork-only file; it gates nothing (the Windows twin runs in puddle-repros.yml).
+# (puddle T-121). Fork-only file; puddle-release.yml calls it as a gate (its `ref`: the tag; the stock control only reports) (the Windows twin runs in puddle-repros.yml).
 #
 # Builds agentd (musl) and msb for Linux from this commit, boots a sandbox, and runs
 # tests/puddle/forward-cap.sh through `ssh -L` over `msb ssh serve`: 200 held forwards must all be
@@ -24,6 +24,18 @@ on:
       - crates/agentd/lib/agent.rs
       - crates/runtime/lib/runner/relay.rs
       - sdk/rust/lib/sandbox/ssh.rs
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit or tag to test (empty: the ref of the run; puddle release passes its tag)"
+        required: false
+        default: ""
+        type: string
+      stock_tag:
+        description: "Upstream release for the control run (empty: no control)"
+        required: false
+        default: v0.7.7
+        type: string
   workflow_dispatch:
     inputs:
       stock_tag:
@@ -45,6 +57,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Upstream release of this fork version
         id: up
@@ -106,6 +120,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           sparse-checkout: |
             tests/puddle
             .github/puddle

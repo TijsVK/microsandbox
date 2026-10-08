@@ -1,5 +1,5 @@
 # puddle fork: tail loss on Unix-socket vsock routes (microsandbox#1753 and its guest-to-host
-# mirror) on a hosted Linux runner with KVM (puddle T-155). Fork-only file; it gates nothing.
+# mirror) on a hosted Linux runner with KVM (puddle T-155). Fork-only file; puddle-release.yml calls it as a gate (its `ref`: the tag; the stock control only reports).
 #
 # Builds msb for Linux from this commit (optionally against another TijsVK/libkrun commit) and runs
 # tests/puddle/vsock-tail.sh against it in a real microVM. The same cases also run against
@@ -23,6 +23,18 @@ on:
       - .github/workflows/puddle-vsock-tail.yml
       - tests/puddle/vsock-tail.*
       - Cargo.lock
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit or tag to test (empty: the ref of the run; puddle release passes its tag)"
+        required: false
+        default: ""
+        type: string
+      stock_tag:
+        description: "Upstream release for the control run (empty: no control)"
+        required: false
+        default: v0.7.7
+        type: string
   workflow_dispatch:
     inputs:
       libkrun_rev:
@@ -54,6 +66,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Upstream release of this fork version
         id: up
@@ -128,6 +142,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           sparse-checkout: |
             tests/puddle
             .github/puddle
