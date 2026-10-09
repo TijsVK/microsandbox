@@ -51,7 +51,7 @@ img=$MSB_HOME/volumes/$vol/disk.raw
 g() { "$msb" exec --no-tty --no-stdin "$name" -- sh -c "$1" </dev/null; }
 
 echo "image after create: $(mib "$img") MiB allocated"
-dev=$(g "basename \$(readlink -f /dev/block/\$(mountpoint -d /data))" | tr -d '\r\n')
+dev=$(g "findmnt -no SOURCE /data" | tr -d '\r\n'); dev=${dev#/dev/}
 adv=$(g "cat /sys/block/$dev/queue/discard_max_bytes" | tr -d '\r\n')
 echo "guest device $dev: discard_max_bytes=$adv"
 g "head -c 1073741824 /dev/urandom > /data/big && sync" || { echo "setup: guest write failed"; exit 2; }
