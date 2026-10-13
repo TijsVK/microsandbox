@@ -35,6 +35,7 @@ pick      | fix(runtime): report a failed log rotation, keep writing and retry i
 pick      | fix(image): retry transient registry failures and report a failed token request | msb-registry-transient-retry | -
 pick      | fix(sdk): start the sandbox process in a session and console of its own | msb-console-isolation | -
 pick      | fix(image): write the ext4 journal when an image is created             | msb-guest-fsync-latency                 | -
+pick      | fix(image): resume a layer download whose body broke off                | msb-layer-body-resume                   | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
