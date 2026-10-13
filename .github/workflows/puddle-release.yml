@@ -458,6 +458,14 @@ jobs:
           cargo test --locked -p microsandbox-image --lib ext4:: -- --nocapture
           if ($LASTEXITCODE -ne 0) { throw "microsandbox-image ext4 tests failed" }
 
+      # Layer body resume (image): a layer the registry cancels part way through (HTTP/2 RST_STREAM
+      # CANCEL) continues with a Range request inside the same download.
+      - name: microsandbox-image layer download tests (a broken body resumes)
+        shell: pwsh
+        run: |
+          cargo test --locked -p microsandbox-image --lib layer:: -- --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-image layer tests failed" }
+
       # libkrun fixes: credit stall + tail-loss shutdown order (vsock), unplug zero-fill (mem, Windows-only tests).
       - name: msb_krun_devices tests
         shell: pwsh
@@ -552,11 +560,12 @@ jobs:
 
       # relay crash fix (runtime), forward limit (protocol, runtime), stale dir + ssh fixes (SDK), ssh
       # fixes (CLI), guest journal fix (image formatter; the SDK lib tests cover the sandbox root and
-      # disk volume paths).
+      # disk volume paths), layer body resume (image downloader).
       - name: msb lib tests
         run: |
           set -euo pipefail
           cargo test --locked -p microsandbox-image --lib ext4::
+          cargo test --locked -p microsandbox-image --lib layer::
           cargo test --locked -p microsandbox-protocol --lib
           cargo test --locked -p microsandbox-runtime --lib
           cargo test --locked -p microsandbox --features ssh --lib
