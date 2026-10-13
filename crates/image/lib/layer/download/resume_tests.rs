@@ -134,13 +134,19 @@ async fn serve(registry: Arc<Registry>) -> (String, Vec<u8>) {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    // The CA and the leaf need different names: with rcgen's default one for both, Windows' chain
+    // builder takes the leaf for a self-signed certificate and cannot verify its signature.
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "layer download test root");
     let ca = ca_params.self_signed(&ca_key).unwrap();
     let issuer = rcgen::Issuer::new(ca_params, ca_key);
     let leaf_key = rcgen::KeyPair::generate().unwrap();
-    let leaf = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
-        .unwrap()
-        .signed_by(&leaf_key, &issuer)
-        .unwrap();
+    let mut leaf_params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
