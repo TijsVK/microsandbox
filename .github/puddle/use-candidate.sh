@@ -26,14 +26,14 @@ echo "candidate msb: $(git log -1 --format='%h %s')"
 for leg in libkrun russh; do
   b=$(field "$leg" bundle)
   [ -n "$b" ] || continue
-  url=$(field "$leg" url); branch=$(field "$leg" branch); base=$(field "$leg" base); base_url=$(field "$leg" base_url)
+  url=$(field "$leg" url); branch=$(field "$leg" branch); tag=$(field "$leg" tag); base=$(field "$leg" base); base_url=$(field "$leg" base_url)
   m="${RUNNER_TEMP:-$d}/forks/$leg"
   mkdir -p "$m"
   git init -q --bare "$m"
   # Full history of the base: cargo's git fetch refuses a shallow source.
   git -C "$m" fetch -q --no-tags "$base_url" "$base"
-  git -C "$m" fetch -q --no-tags "$d/$b" "+refs/heads/$branch:refs/heads/$branch"
+  git -C "$m" fetch -q --no-tags "$d/$b" "+refs/heads/$branch:refs/heads/$branch" "+refs/tags/$tag:refs/tags/$tag"
   git config --global url."$(fileurl "$m")".insteadOf "$url"
-  echo "candidate $leg: $url branch $branch = $(git -C "$m" rev-parse "refs/heads/$branch") (local mirror $m)"
+  echo "candidate $leg: $url tag $tag = $(git -C "$m" rev-parse "refs/tags/$tag^{commit}") (local mirror $m)"
 done
 if [ -n "${GITHUB_ENV:-}" ]; then echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"; fi
