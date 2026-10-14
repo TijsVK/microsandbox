@@ -16,6 +16,8 @@
 #
 # action  | match                                                                   | folder                                  | upstream
 krun      | build: use the puddle libkrun fork*                                     | -                                       | -
+krun      | build: bump the libkrun fork to*                                        | libkrun-bounded-writeback-discard       | -
+krun      | build: pin the libkrun and russh forks by tag*                          | -                                       | -
 pick      | fix(runtime): drop a late bulk finish for a retired flow                | msb-relay-cross-lane-merge              | -
 pick      | fix(ssh): report refused forwards as connect failed                     | msb-ssh-forward-connect-failed          | -
 pick      | fix(ssh): report SFTP exit status so scp exits 0                        | msb-ssh-sftp-exit-status                | -
@@ -37,6 +39,9 @@ pick      | fix(sdk): start the sandbox process in a session and console of its 
 pick      | fix(image): write the ext4 journal when an image is created             | msb-guest-fsync-latency                 | -
 pick      | fix(image): resume a layer download whose body broke off                | msb-layer-body-resume                   | -
 pick      | test(image): give the layer download test's CA a name of its own        | msb-layer-body-resume                   | -
+pick      | fix(db): retry connecting to the catalog on a transient SQLite I/O error | msb-sqlite-open-io-error                | -
+pick      | test(db): a terminated writer may not have committed anything           | msb-sqlite-open-io-error                | -
+pick      | fix(image): write the ext4 journal when an upper or volume image is created | msb-guest-fsync-latency            | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
