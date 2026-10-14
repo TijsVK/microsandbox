@@ -4221,7 +4221,7 @@ mod tests {
         let rootfs = tempfile::tempdir().unwrap();
         std::fs::write(rootfs.path().join("probe"), b"\x7fELF").unwrap();
 
-        let fs = bind_rootfs_backend(rootfs.path(), true).unwrap();
+        let fs = bind_rootfs_backend(rootfs.path(), true, msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES).unwrap();
         fs.init(FsOptions::empty()).unwrap();
 
         // devtmpfs needs /dev before PID 1 runs.
@@ -4260,7 +4260,7 @@ mod tests {
     fn test_bind_rootfs_that_is_refused_gets_no_dev() {
         let parent = tempfile::tempdir().unwrap();
         let missing = parent.path().join("missing");
-        assert!(bind_rootfs_backend(&missing, true).is_err());
+        assert!(bind_rootfs_backend(&missing, true, msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES).is_err());
         assert!(!missing.exists());
     }
 
