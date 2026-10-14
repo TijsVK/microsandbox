@@ -60,16 +60,16 @@ for leg in libkrun russh; do
   git -C "$m" fetch -q --no-tags "$base_url" "$base"
   git -C "$m" fetch -q --no-tags "$d/$b" "refs/heads/$branch:refs/heads/$branch"
   push_new_branch "$m" "$(remote "$slug")" "$branch" "$sha"
-  tag=$(field "$leg" tag)
-  git -C "$m" fetch -q --no-tags "$d/$b" "refs/tags/$tag:refs/tags/$tag"
-  have=$(git ls-remote "$url" "refs/tags/$tag^{}" "refs/tags/$tag" | cut -f1 | tail -1)
+  leg_tag=$(field "$leg" tag)
+  git -C "$m" fetch -q --no-tags "$d/$b" "refs/tags/$leg_tag:refs/tags/$leg_tag"
+  have=$(git ls-remote "$url" "refs/tags/$leg_tag^{}" "refs/tags/$leg_tag" | cut -f1 | tail -1)
   if [ -n "$have" ]; then
-    [ "$have" = "$sha" ] || { echo "::error::tag $tag already exists at $have, want $sha; not moving it"; exit 1; }
-    echo "$tag already at $sha"
+    [ "$have" = "$sha" ] || { echo "::error::tag $leg_tag already exists at $have, want $sha; not moving it"; exit 1; }
+    echo "$leg_tag already at $sha"
   else
-    git -C "$m" "${GIT_ID[@]}" tag -f -a "$tag" -m "$tag: $leg fork at $ver plus the puddle fixes (auto-bump for $up_tag)" "$sha"
-    git -C "$m" push -q "$(remote "$slug")" "refs/tags/$tag"
-    echo "tagged $tag"
+    git -C "$m" "${GIT_ID[@]}" tag -f -a "$leg_tag" -m "$leg_tag: $leg fork at $ver plus the puddle fixes (auto-bump for $up_tag)" "$sha"
+    git -C "$m" push -q "$(remote "$slug")" "refs/tags/$leg_tag"
+    echo "tagged $leg_tag"
   fi
 done
 
