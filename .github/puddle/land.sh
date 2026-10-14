@@ -60,14 +60,16 @@ for leg in libkrun russh; do
   git -C "$m" fetch -q --no-tags "$base_url" "$base"
   git -C "$m" fetch -q --no-tags "$d/$b" "refs/heads/$branch:refs/heads/$branch"
   push_new_branch "$m" "$(remote "$slug")" "$branch" "$sha"
-  if [ "$leg" = libkrun ]; then
-    n=$(git ls-remote --tags "$url" "refs/tags/msb_krun-v$ver-puddle.*" | sed -n 's/.*-puddle\.\([0-9]*\)$/\1/p' | sort -n | tail -1)
-    if ! git ls-remote --tags "$url" "refs/tags/msb_krun-v$ver-puddle.*" | grep -q "^$sha"; then
-      ktag="msb_krun-v$ver-puddle.$(( ${n:-0} + 1 ))"
-      git -C "$m" "${GIT_ID[@]}" tag -a "$ktag" -m "$ktag: msb_krun $ver plus the puddle libkrun fixes (auto-bump for $up_tag)" "$sha"
-      git -C "$m" push -q "$(remote "$slug")" "refs/tags/$ktag"
-      echo "tagged $ktag"
-    fi
+  tag=$(field "$leg" tag)
+  git -C "$m" fetch -q --no-tags "$d/$b" "refs/tags/$tag:refs/tags/$tag"
+  have=$(git ls-remote "$url" "refs/tags/$tag^{}" "refs/tags/$tag" | cut -f1 | tail -1)
+  if [ -n "$have" ]; then
+    [ "$have" = "$sha" ] || { echo "::error::tag $tag already exists at $have, want $sha; not moving it"; exit 1; }
+    echo "$tag already at $sha"
+  else
+    git -C "$m" "${GIT_ID[@]}" tag -f -a "$tag" -m "$tag: $leg fork at $ver plus the puddle fixes (auto-bump for $up_tag)" "$sha"
+    git -C "$m" push -q "$(remote "$slug")" "refs/tags/$tag"
+    echo "tagged $tag"
   fi
 done
 

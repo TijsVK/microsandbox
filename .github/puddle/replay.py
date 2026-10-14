@@ -146,20 +146,20 @@ def render_patch_section(krun, russh, imago=None):
         return ""
     lines = ["", MARKER]
     if krun:
-        lines.append(f"# libkrun: TijsVK/libkrun branch {krun['branch']} = msb_krun {krun['base_version']} "
+        lines.append(f"# libkrun: TijsVK/libkrun tag {krun['tag']} = msb_krun {krun['base_version']} "
                      f"plus the puddle libkrun fixes.")
     if russh:
-        lines.append(f"# russh: TijsVK/russh branch {russh['branch']} = russh {russh['base_version']} "
+        lines.append(f"# russh: TijsVK/russh tag {russh['tag']} = russh {russh['base_version']} "
                      f"plus the puddle russh fix.")
     if imago:
         lines.append(f"# imago: TijsVK/imago tag {imago['tag']} = msb-imago {imago['base_version']} "
                      f"plus the puddle fdatasync fix.")
-    lines.append("# One branch per base version, so older fork tags stay buildable.")
+    lines.append("# One tag per base version (a tag names one commit and is never moved), so older fork tags stay buildable.")
     lines.append("[patch.crates-io]")
     for leg, url in ((krun, LIBKRUN_URL), (russh, RUSSH_URL)):
         if leg:
             for crate in leg["crates"]:
-                lines.append(f'{crate} = {{ git = "{url}", branch = "{leg["branch"]}" }}')
+                lines.append(f'{crate} = {{ git = "{url}", tag = "{leg["tag"]}" }}')
     if imago:
         lines.append(f'msb-imago = {{ git = "{IMAGO_URL}", tag = "{imago["tag"]}" }}')
     return "\n".join(lines) + "\n"
@@ -227,18 +227,20 @@ def ensure_clone(path, url, upstream_url):
         run(["git", "clone", "-q", "--no-checkout", url, str(path)])
         git(path, "remote", "add", "upstream", upstream_url)
         git(path, "remote", "set-url", "--push", "upstream", "DISABLED")
-    git(path, "fetch", "-q", "origin")
+    git(path, "fetch", "-q", "--tags", "origin")
     git(path, "config", "user.name", BOT[0])
     git(path, "config", "user.email", BOT[1])
 
 
-def replay_leg(path, base, commits, branch):
+def replay_leg(path, base, commits, branch, tag):
     git(path, "checkout", "-q", "-f", "-B", branch, base)
     kept, dropped = [], []
     for c in commits:
         subj = out(path, "log", "-1", "--format=%s", c)
         r = pick(path, c)
         (kept if r == "picked" else dropped).append(subj)
+    # The tag is what the manifest pins; land.sh pushes it (annotated) with the branch.
+    git(path, "tag", "-f", tag, "HEAD")
     return out(path, "rev-parse", "HEAD"), kept, dropped
 
 
@@ -270,14 +272,14 @@ def krun_version_at(path, rev):
 
 
 def libkrun_leg(args, cur_toml, new_lock, up_pin):
-    cur_branch = re.search(rf'git = "{re.escape(LIBKRUN_URL)}", branch = "([^"]+)"', cur_toml)
-    if not cur_branch:
+    cur_pin = re.search(rf'git = "{re.escape(LIBKRUN_URL)}", (branch|tag) = "([^"]+)"', cur_toml)
+    if not cur_pin:
         return None, {"leg": "libkrun", "state": "not wired"}
-    cur_branch = cur_branch.group(1)
+    cur_kind, cur_branch = cur_pin.groups()
     path = Path(args.work) / "libkrun"
     ensure_clone(path, LIBKRUN_URL, LIBKRUN_UPSTREAM)
     git(path, "fetch", "-q", "upstream", LIBKRUN_UPSTREAM_BRANCH)
-    cur_tip = out(path, "rev-parse", f"origin/{cur_branch}")
+    cur_tip = out(path, "rev-parse", f"refs/tags/{cur_branch}^{{commit}}" if cur_kind == "tag" else f"origin/{cur_branch}")
     cur_base = out(path, "merge-base", cur_tip, f"upstream/{LIBKRUN_UPSTREAM_BRANCH}")
     cur_ver = krun_version_at(path, cur_base)
     commits = out(path, "rev-list", "--reverse", "--no-merges", f"{cur_base}..{cur_tip}").splitlines()
@@ -287,29 +289,32 @@ def libkrun_leg(args, cur_toml, new_lock, up_pin):
     moved = semver(up_pin) > semver(cur_ver)
     if not moved and not args.force_legs:
         info["state"] = "unchanged"
-        return {"branch": cur_branch, "sha": cur_tip, "base_version": cur_ver, "pin": cur_ver,
+        return {"tag": cur_branch, "sha": cur_tip, "base_version": cur_ver, "pin": cur_ver,
                 "crates": crates, "local": False}, info
     target = up_pin if moved else cur_ver
     base, how = (krun_base_for(path, target) if moved else (cur_base, "current base (forced)"))
     branch = f"puddle-{target}"
-    tip, kept, dropped = replay_leg(path, base, commits, branch)
-    info.update({"state": "replayed", "branch": branch, "base": base, "base_found_by": how,
+    tag = f"msb_krun-v{target}-puddle.1"
+    tip, kept, dropped = replay_leg(path, base, commits, branch, tag)
+    info.update({"state": "replayed", "branch": branch, "tag": tag, "base": base, "base_found_by": how,
                  "kept": kept, "dropped": dropped, "sha": tip,
                  "tree_equal_to_current": out(path, "rev-parse", f"{tip}^{{tree}}") ==
                  out(path, "rev-parse", f"{cur_tip}^{{tree}}")})
     if not kept:
         info["state"] = "all fixes upstream: patch dropped"
         return None, info
-    return {"branch": branch, "sha": tip, "base": base, "base_version": target, "pin": target,
+    return {"branch": branch, "tag": tag, "sha": tip, "base": base, "base_version": target, "pin": target,
             "crates": crates, "local": True, "path": str(path)}, info
 
 
 def russh_leg(args, cur_toml, new_lock):
-    m = re.search(rf'git = "{re.escape(RUSSH_URL)}", branch = "puddle-([^"]+)"', cur_toml)
+    m = re.search(rf'git = "{re.escape(RUSSH_URL)}", (?:branch = "puddle-([^"]+)"|tag = "v([0-9][^"]*)-puddle\.\d+")',
+                  cur_toml)
     if not m:
         return None, {"leg": "russh", "state": "not wired"}
-    cur_ver = m.group(1)
+    cur_ver = m.group(1) or m.group(2)
     cur_branch = f"puddle-{cur_ver}"
+    cur_tag = re.search(rf'git = "{re.escape(RUSSH_URL)}", tag = "([^"]+)"', cur_toml)
     crates = patch_lines_for(cur_toml, RUSSH_URL)
     vers = lock_versions(new_lock, "russh")
     if len(vers) != 1:
@@ -318,24 +323,25 @@ def russh_leg(args, cur_toml, new_lock):
     path = Path(args.work) / "russh"
     ensure_clone(path, RUSSH_URL, RUSSH_UPSTREAM)
     git(path, "fetch", "-q", "upstream", "tag", f"v{cur_ver}", "--no-tags")
-    cur_tip = out(path, "rev-parse", f"origin/{cur_branch}")
+    cur_tip = out(path, "rev-parse", f"refs/tags/{cur_tag.group(1)}^{{commit}}" if cur_tag else f"origin/{cur_branch}")
     info = {"leg": "russh", "current_branch": cur_branch, "current_version": cur_ver, "release_lock": rel}
     if rel == cur_ver and not args.force_legs:
         info["state"] = "unchanged"
-        return {"branch": cur_branch, "sha": cur_tip, "base_version": cur_ver, "crates": crates,
+        return {"tag": cur_tag.group(1), "sha": cur_tip, "base_version": cur_ver, "crates": crates,
                 "local": False}, info
     commits = out(path, "rev-list", "--reverse", "--no-merges", f"v{cur_ver}..{cur_tip}").splitlines()
     git(path, "fetch", "-q", "upstream", "tag", f"v{rel}", "--no-tags")
     base = out(path, "rev-parse", f"v{rel}^{{commit}}")
     branch = f"puddle-{rel}"
-    tip, kept, dropped = replay_leg(path, base, commits, branch)
-    info.update({"state": "replayed", "branch": branch, "base": base, "kept": kept, "dropped": dropped,
+    tag = f"v{rel}-puddle.1"
+    tip, kept, dropped = replay_leg(path, base, commits, branch, tag)
+    info.update({"state": "replayed", "branch": branch, "tag": tag, "base": base, "kept": kept, "dropped": dropped,
                  "sha": tip, "tree_equal_to_current": out(path, "rev-parse", f"{tip}^{{tree}}") ==
                  out(path, "rev-parse", f"{cur_tip}^{{tree}}")})
     if not kept:
         info["state"] = "fix upstream: patch dropped"
         return None, info
-    return {"branch": branch, "sha": tip, "base": base, "base_version": rel, "crates": crates,
+    return {"branch": branch, "tag": tag, "sha": tip, "base": base, "base_version": rel, "crates": crates,
             "local": True, "path": str(path)}, info
 
 
@@ -568,8 +574,8 @@ crates/utils/lib/lib.rs. Changed for the puddle fork by its auto-bump job, {date
         f"^{bundles['msb']['old']}")
     for name, leg, url in (("libkrun", applied_krun, LIBKRUN_URL), ("russh", applied_russh, RUSSH_URL)):
         if leg and leg["local"]:
-            git(leg["path"], "bundle", "create", str(work / f"{name}.bundle"), f"refs/heads/{leg['branch']}", f"^{leg['base']}")
-            bundles[name] = {"bundle": f"{name}.bundle", "url": url, "branch": leg["branch"], "sha": leg["sha"],
+            git(leg["path"], "bundle", "create", str(work / f"{name}.bundle"), f"refs/heads/{leg['branch']}", f"refs/tags/{leg['tag']}", f"^{leg['base']}")
+            bundles[name] = {"bundle": f"{name}.bundle", "url": url, "branch": leg["branch"], "tag": leg["tag"], "sha": leg["sha"],
                              "base": leg["base"], "base_url": LIBKRUN_UPSTREAM if name == "libkrun" else RUSSH_UPSTREAM,
                              "base_version": leg["base_version"]}
     (work / "candidate.json").write_text(json.dumps(bundles, indent=2))
@@ -586,7 +592,7 @@ def leg_message(action, leg, krun, russh, upstream_tag, date, report):
         fixes = info.get("kept") or []
         body = f"""
 Pin msb_krun and msb_krun_utils to ={leg['pin']} and take every msb_krun_* crate from
-TijsVK/libkrun branch `{leg['branch']}` ({leg['sha'][:12]}) through [patch.crates-io]. That branch is
+TijsVK/libkrun tag `{leg['tag']}` ({leg['sha'][:12]}) through [patch.crates-io]. That tag is
 msb_krun {leg['base_version']} plus the puddle libkrun fixes{':' if fixes else '.'}
 """ + "".join(f"- {f}\n" for f in fixes) + f"""
 Regenerated by .github/puddle/replay.py for {upstream_tag} (libkrun leg: {info['state']}).
@@ -608,7 +614,7 @@ the puddle fork by its auto-bump job, {date}."""
         return message(f"build: use the puddle imago fork (msb-imago {leg['base_version']} with fdatasync)", body)
     info = next(i for i in report["legs"] if i["leg"] == "russh")
     body = f"""
-[patch.crates-io] takes {', '.join(leg['crates'])} from TijsVK/russh branch `{leg['branch']}`
+[patch.crates-io] takes {', '.join(leg['crates'])} from TijsVK/russh tag `{leg['tag']}`
 ({leg['sha'][:12]}): russh {leg['base_version']} plus the fix for the session wedge when the peer
 closes a channel with queued data (puddle upstream-issues/russh-peer-close-pending-data-wedge/).
 
@@ -675,7 +681,7 @@ def summary(rep):
     for leg in rep["legs"]:
         s += ["", f"{leg['leg']} leg: **{leg['state']}**" + "".join(
             f"; {k} `{v}`" for k, v in leg.items() if k in ("current_branch", "current_version", "release_pin",
-                                                          "release_lock", "branch", "base", "sha", "base_found_by",
+                                                          "release_lock", "branch", "tag", "base", "sha", "base_found_by",
                                                           "tree_equal_to_current"))]
         if leg.get("kept") is not None:
             s += [f"  - kept: {k}" for k in leg["kept"]] + [f"  - dropped (empty): {d}" for d in leg.get("dropped", [])]
