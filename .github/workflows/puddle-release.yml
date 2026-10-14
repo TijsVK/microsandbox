@@ -442,7 +442,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          src=$(grep -m1 -o 'git+https://github.com/TijsVK/libkrun?branch=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
+          src=$(grep -m1 -o 'git+https://github.com/TijsVK/libkrun?[a-z]*=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
           sha=${src##*#}
           echo "libkrun source from Cargo.lock: $src"
           git init -q libkrun
@@ -574,7 +574,7 @@ jobs:
       - name: Checkout the locked libkrun fork commit
         run: |
           set -euo pipefail
-          src=$(grep -m1 -o 'git+https://github.com/TijsVK/libkrun?branch=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
+          src=$(grep -m1 -o 'git+https://github.com/TijsVK/libkrun?[a-z]*=[^#"]*#[0-9a-f]\{40\}' Cargo.lock)
           sha=${src##*#}
           echo "libkrun source from Cargo.lock: $src"
           git init -q libkrun

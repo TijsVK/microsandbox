@@ -220,25 +220,25 @@ rpassword = "7"
 russh = "0.63.1"
 russh-sftp = "2.3.0"
 
-# puddle fork: build against TijsVK/libkrun branch `puddle` (msb_krun 0.1.41 plus
+# puddle fork: build against TijsVK/libkrun tag `msb_krun-v0.1.41-puddle.2` (msb_krun 0.1.41 plus
 # the puddle fixes). 0.1.41 is not on crates.io, so the pin above and this
 # patch go together. Drop both once upstream pins a release with the fixes.
 [patch.crates-io]
-msb_krun = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_arch = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_arch_gen = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_cpuid = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_devices = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_hvf = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_kernel = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_polly = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_smbios = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_utils = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
-msb_krun_vmm = { git = "https://github.com/TijsVK/libkrun", branch = "puddle" }
+msb_krun = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_arch = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_arch_gen = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_cpuid = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_devices = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_hvf = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_kernel = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_polly = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_smbios = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_utils = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
+msb_krun_vmm = { git = "https://github.com/TijsVK/libkrun", tag = "msb_krun-v0.1.41-puddle.2" }
 # puddle fork: russh 0.63.3 (the version Cargo.lock resolves) plus the fix for the
 # session wedge when the peer closes a channel with queued data. One branch per
-# russh base version; move to a new `puddle-<version>` branch when the lock moves.
-russh = { git = "https://github.com/TijsVK/russh", branch = "puddle-0.63.3" }
+# russh base version, pinned by tag `v<version>-puddle.<n>`; move to a new one when the lock moves.
+russh = { git = "https://github.com/TijsVK/russh", tag = "v0.63.3-puddle.1" }
 # puddle fork: msb-imago 0.1.7 (the release Cargo.lock resolves) plus `File::sync()` calling
 # fdatasync instead of fsync, so a guest flush no longer commits the host filesystem journal for
 # the image's mtime. One tag per base version; replay.py stops when the release moves msb-imago.
