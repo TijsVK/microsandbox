@@ -40,6 +40,7 @@ pick      | fix(sdk): start the sandbox process in a session and console of its 
 pick      | fix(image): write the ext4 journal when an image is created             | msb-guest-fsync-latency                 | -
 pick      | fix(image): resume a layer download whose body broke off                | msb-layer-body-resume                   | -
 pick      | test(image): give the layer download test's CA a name of its own        | msb-layer-body-resume                   | -
+pick      | fix(image): give each layer download a connection of its own            | msb-layer-connections                   | -
 pick      | fix(db): retry connecting to the catalog on a transient SQLite I/O error | msb-sqlite-open-io-error                | -
 pick      | test(db): a terminated writer may not have committed anything           | msb-sqlite-open-io-error                | -
 pick      | fix(image): write the ext4 journal when an upper or volume image is created | msb-guest-fsync-latency            | -
