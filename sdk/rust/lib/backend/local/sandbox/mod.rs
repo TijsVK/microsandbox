@@ -852,6 +852,12 @@ impl LocalBackend {
         if alive {
             return Ok(sandbox);
         }
+        // Not stale until the whole process is gone: a killed runtime can release its lifecycle
+        // lock before its disk locks, and a start in between fails on the still-locked disks.
+        #[cfg(target_os = "linux")]
+        if process_exit::thread_group_exiting(run.pid)? {
+            return Ok(sandbox);
+        }
 
         if let Some((run_dir, sandboxes_dir)) = socket_roots {
             crate::runtime::remove_sandbox_socket_artifacts_at(
