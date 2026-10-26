@@ -101,12 +101,14 @@ pub(crate) async fn build_pool(
     Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
 }
 
-/// Waits between attempts to connect when SQLite reports a transient I/O error, about 1.5 s in all.
+/// Waits between attempts to connect when SQLite reports a transient I/O error, about 6.4 s in all.
 ///
 /// Opening the catalog while another msb process that used it is exiting can fail with
 /// `SQLITE_IOERR_TRUNCATE` ("disk I/O error", code 1546) on Windows. SQLite's busy handler does
 /// not cover I/O errors, and the next attempt a moment later succeeds: puddle's Windows runs saw
-/// one such failure per run and a single retry 500 ms later always resolved it.
+/// one such failure per run and a single retry 500 ms later always resolved it. Most clear within
+/// 0.25 s; the tail (1.6 s and 3.2 s) covers the rare longer event, such as one after a hard kill of
+/// the runtime, and costs nothing unless an attempt fails.
 pub(crate) const CONNECT_RETRY_DELAYS: &[Duration] = &[
     Duration::from_millis(25),
     Duration::from_millis(50),
@@ -114,6 +116,8 @@ pub(crate) const CONNECT_RETRY_DELAYS: &[Duration] = &[
     Duration::from_millis(200),
     Duration::from_millis(400),
     Duration::from_millis(800),
+    Duration::from_millis(1600),
+    Duration::from_millis(3200),
 ];
 
 /// SQLite's primary result code for I/O errors; extended codes carry it in their low byte.
