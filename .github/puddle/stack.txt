@@ -46,6 +46,8 @@ pick      | test(db): a terminated writer may not have committed anything       
 pick      | fix(image): write the ext4 journal when an upper or volume image is created | msb-guest-fsync-latency            | -
 pick      | test: reconcile while a killed runtime's threads still exit              | msb-reconcile-zombie-runtime-disk-lock  | -
 pick      | fix(local): keep a killed runtime live until its thread group exits      | msb-reconcile-zombie-runtime-disk-lock  | -
+pick      | fix(runtime): close the catalog pool when the sandbox runtime exits       | msb-sqlite-open-io-error                | -
+pick      | fix(db): retry connecting to the catalog for about 6 s                  | msb-sqlite-open-io-error                | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
