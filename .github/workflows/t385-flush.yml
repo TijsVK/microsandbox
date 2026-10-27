@@ -1,0 +1,112 @@
+# puddle fork: guest fsync cost on a Windows (WHP) host, per build and image layout (measurement only,
+# never merged; lives on its own branch t385-flush and is deleted with it). Counts host flushes per
+# guest op with ETW (NT Kernel Logger: DiskIo flush/write, FileIo flush) on hosted windows-2025 runners.
+#
+#   gh workflow run t385-flush.yml -R TijsVK/microsandbox --ref t385-flush -f case=counts \
+#     -f builds='["v0.7.7-puddle.12","v0.7.8-puddle.6"]' -f layouts='["a,b,z"]'
+name: t385 flush
+
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: "probe | counts | apt"
+        default: probe
+        type: string
+      builds:
+        description: "JSON array of fork release tags, one windows-2025 job each"
+        default: '["v0.7.8-puddle.6"]'
+        type: string
+      layouts:
+        description: "JSON array, one job per entry; an entry is comma-separated layouts run in that job (a sparse, b journal written, g grow-ahead chunks, z non-sparse zero-written, v non-sparse valid data length set)"
+        default: '["a"]'
+        type: string
+      count:
+        description: "Ops per pattern"
+        default: "50"
+        type: string
+      patterns:
+        description: "fsbench patterns"
+        default: "overwrite,overwrite-fdatasync,append,newfile"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  fsbench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/t330
+      - run: gcc -O2 -static -o fsbench .github/t330/fsbench.c && file fsbench
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fsbench
+          path: fsbench
+
+  measure:
+    needs: fsbench
+    name: ${{ inputs.case || 'probe' }} ${{ matrix.build }} ${{ matrix.layout }}
+    runs-on: windows-2025
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        build: ${{ fromJSON(inputs.builds || '["v0.7.8-puddle.6"]') }}
+        layout: ${{ fromJSON(inputs.layouts || '["a"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            tests/puddle
+            .github/puddle
+            .github/t330
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fsbench
+          path: fsb
+      - name: msb.exe + libkrunfw from ${{ matrix.build }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ matrix.build }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dl \
+            -p checksums.sha256 -p msb-windows-x86_64.exe -p libkrunfw-windows-x86_64.dll
+          v=.github/puddle/verify-asset.sh
+          bash "$v" dl/checksums.sha256 dl/msb-windows-x86_64.exe msb-windows-x86_64.exe
+          bash "$v" dl/checksums.sha256 dl/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+      - name: Measure
+        shell: pwsh
+        env:
+          CASE: ${{ inputs.case || 'probe' }}
+          BUILD: ${{ matrix.build }}
+          LAYOUTS: ${{ matrix.layout }}
+          COUNT: ${{ inputs.count || '50' }}
+          PATTERNS: ${{ inputs.patterns || 'overwrite,overwrite-fdatasync,append,newfile' }}
+        run: |
+          New-Item -ItemType Directory -Force -Path runtime | Out-Null
+          Copy-Item dl\msb-windows-x86_64.exe runtime\msb.exe -Force
+          Copy-Item dl\libkrunfw-windows-x86_64.dll runtime\libkrunfw.dll -Force
+          & runtime\msb.exe --version
+          $py = (Get-Command python).Source
+          & $py --version
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          "host: $($cs.NumberOfLogicalProcessors) logical CPUs, $([int]($cs.TotalPhysicalMemory / 1GB)) GB, $($cpu.Name), HypervisorPresent=$($cs.HypervisorPresent)"
+          $w = Join-Path $env:RUNNER_TEMP 'w'
+          ./tests/puddle/run-outside-job.ps1 -Script .github/t330/measure.ps1 -Log "$env:RUNNER_TEMP/log/measure.log" -TimeoutSec 17000 -- `
+            -Msb "$PWD\runtime\msb.exe" -Libkrunfw "$PWD\runtime\libkrunfw.dll" -Fsbench "$PWD\fsb\fsbench" `
+            -Python $py -Tools "$PWD\.github\t330" -Work $w -EtlDir 'C:\t330etl' -Case $env:CASE -Count $env:COUNT `
+            -Build $env:BUILD -Layouts $env:LAYOUTS -Patterns $env:PATTERNS
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: t330-${{ inputs.case || 'probe' }}-${{ matrix.build }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/log/
+          if-no-files-found: ignore
+          retention-days: 7
