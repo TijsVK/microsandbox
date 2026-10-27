@@ -1,5 +1,7 @@
 # puddle fork: build msb.exe for Windows (MSVC) from a v<release>-puddle.N tag, test it,
 # and publish it as a release asset next to upstream's libkrunfw.dll and the fork-built agentd.
+# The Linux msb is built from the same tag (build-linux) and published with upstream's Linux
+# libkrunfw, so Puddle's CI downloads it instead of building it (about 8 minutes per cache miss).
 #
 # Fork-only file (not in upstream). The kernel and libkrunfw stay upstream's: they are downloaded
 # from the matching upstream release and checked against its checksums.sha256. agentd is built here
@@ -142,7 +144,7 @@ jobs:
           echo "prev_tag=$prev" >> "$GITHUB_OUTPUT"
           echo "previous fork release for the volume check: ${prev:-none}"
 
-      - name: Download upstream libkrunfw.dll, agentd, checksums
+      - name: Download upstream libkrunfw (Windows, Linux), agentd, checksums
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM_TAG: ${{ steps.tags.outputs.upstream_tag }}
@@ -150,13 +152,14 @@ jobs:
           set -euo pipefail
           mkdir -p upstream
           gh release download "$UPSTREAM_TAG" -R "$UPSTREAM_REPO" -D upstream \
-            -p checksums.sha256 -p libkrunfw-windows-x86_64.dll -p agentd-x86_64
+            -p checksums.sha256 -p libkrunfw-windows-x86_64.dll -p libkrunfw-linux-x86_64.so -p agentd-x86_64
 
       - name: Verify against upstream checksums.sha256
         run: |
           set -euo pipefail
           v=.github/puddle/verify-asset.sh
           bash "$v" upstream/checksums.sha256 upstream/libkrunfw-windows-x86_64.dll libkrunfw-windows-x86_64.dll
+          bash "$v" upstream/checksums.sha256 upstream/libkrunfw-linux-x86_64.so libkrunfw-linux-x86_64.so
           bash "$v" upstream/checksums.sha256 upstream/agentd-x86_64 agentd-x86_64
           # Self-test: a file with one byte changed must be refused.
           cp upstream/agentd-x86_64 corrupted
@@ -382,6 +385,74 @@ jobs:
         with:
           name: msb-windows-x86_64
           path: out/msb-windows-x86_64.exe
+          compression-level: 0
+
+  # The Linux msb, built from the tag's own source like the Windows one, embedding this run's agentd.
+  # ubuntu-22.04 (glibc 2.35) so the binary also runs on older developer hosts.
+  build-linux:
+    name: Build msb (Linux, x86_64)
+    needs: [prepare, build-agentd]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.candidate }}
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.prepare.outputs.upstream_tag }}
+
+      # Helper scripts come from the workflow's own commit, which may be newer than the tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: _puddle
+          sparse-checkout: .github/puddle
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.candidate }}
+        with:
+          name: puddle-candidate
+          path: ${{ runner.temp }}/candidate
+
+      - name: Check out the candidate (bundles, local fork mirrors)
+        if: ${{ inputs.candidate }}
+        shell: bash
+        run: bash _puddle/.github/puddle/use-candidate.sh "$RUNNER_TEMP/candidate"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: puddle-release-linux
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upstream-assets
+          path: upstream/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: puddle-agentd
+          path: agentd/
+
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
+      - name: Build msb, check version, linkage and runtime discovery
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash _puddle/.github/puddle/build-linux-msb.sh agentd/agentd-x86_64 upstream/libkrunfw-linux-x86_64.so "$VERSION" out
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msb-linux-x86_64
+          path: out/msb-linux-x86_64
           compression-level: 0
 
   test-windows:
@@ -686,11 +757,11 @@ jobs:
 
   release:
     name: Publish release
-    needs: [prepare, build-agentd, build-windows, test-windows, test-linux, repros, volume-compat, launcher-isolation, vsock-tail, forward-cap-linux, linux-discard]
+    needs: [prepare, build-agentd, build-windows, build-linux, test-windows, test-linux, repros, volume-compat, launcher-isolation, vsock-tail, forward-cap-linux, linux-discard]
     if: >-
       !cancelled() && !inputs.candidate && (github.ref_type == 'tag' || inputs.publish) &&
       needs.prepare.result == 'success' && needs.build-agentd.result == 'success' &&
-      needs.build-windows.result == 'success' &&
+      needs.build-windows.result == 'success' && needs.build-linux.result == 'success' &&
       needs.test-windows.result == 'success' && needs.test-linux.result == 'success' &&
       needs.repros.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.volume-compat.result) &&
       needs.launcher-isolation.result == 'success' && needs.vsock-tail.result == 'success' &&
@@ -713,6 +784,11 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: msb-windows-x86_64
+          path: assets/
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: msb-linux-x86_64
           path: assets/
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
