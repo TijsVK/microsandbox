@@ -16,6 +16,7 @@
 #
 # action  | match                                                                   | folder                                  | upstream
 krun      | build: use the puddle libkrun fork*                                     | -                                       | -
+krun      | build: bump the libkrun fork to msb_krun-v0.1.41-puddle.4*              | libkrun-windows-one-flush               | -
 krun      | build: bump the libkrun fork to*                                        | libkrun-bounded-writeback-discard       | -
 krun      | build: pin the libkrun and russh forks by tag*                          | -                                       | -
 pick      | fix(runtime): drop a late bulk finish for a retired flow                | msb-relay-cross-lane-merge              | -
