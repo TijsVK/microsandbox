@@ -17,6 +17,7 @@
 # action  | match                                                                   | folder                                  | upstream
 krun      | build: use the puddle libkrun fork*                                     | -                                       | -
 krun      | build: bump the libkrun fork to msb_krun-v0.1.41-puddle.4*              | libkrun-windows-one-flush               | -
+krun      | build: bump the libkrun fork to msb_krun-v0.1.41-puddle.5*              | msb-guest-fsync-latency                 | -
 krun      | build: bump the libkrun fork to*                                        | libkrun-bounded-writeback-discard       | -
 krun      | build: pin the libkrun and russh forks by tag*                          | -                                       | -
 pick      | fix(runtime): drop a late bulk finish for a retired flow                | msb-relay-cross-lane-merge              | -
@@ -49,6 +50,7 @@ pick      | test: reconcile while a killed runtime's threads still exit         
 pick      | fix(local): keep a killed runtime live until its thread group exits      | msb-reconcile-zombie-runtime-disk-lock  | -
 pick      | fix(runtime): close the catalog pool when the sandbox runtime exits       | msb-sqlite-open-io-error                | -
 pick      | fix(db): retry connecting to the catalog for about 6 s                  | msb-sqlite-open-io-error                | -
+pick      | feat(runtime): MSB_BLOCK_GROW_AHEAD turns block grow-ahead on or off    | msb-guest-fsync-latency                 | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
