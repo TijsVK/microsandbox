@@ -65,6 +65,18 @@ g "sync"
 running=$(mib "$img")
 echo "image after fstrim (running): $running MiB allocated"
 g "fstrim -v /" 2>&1 | sed 's/^/fstrim \/ (info): /'
+echo "=== DIAG root disk"
+g "cat /proc/mounts | grep -v -E 'proc|sysfs|devpts|cgroup|mqueue'" 2>&1 | sed 's/^/mounts: /'
+g "ls /sys/block; for d in /sys/block/vd*; do echo \$d discard_max_bytes=\$(cat \$d/queue/discard_max_bytes) size=\$(cat \$d/size); done" 2>&1 | sed 's/^/blk: /'
+g "ls -l /proc/1/fd | grep -v -E 'pipe|socket|null|anon'; cat /proc/1/cmdline | tr '\\0' ' '; echo; ls -la /.msb /.msb/rootfs 2>&1" 2>&1 | sed 's/^/pid1: /'
+find "$MSB_HOME" -type f \( -name '*.raw' -o -name '*.ext4' -o -name '*.qcow2' -o -name '*.erofs' -o -name '*.img' \) -printf '%s %b %p\n' 2>&1 | sed 's/^/hostfiles: /'
+g "head -c 536870912 /dev/urandom > /root-big && sync" ; echo "rootwrite rc=$?"
+find "$MSB_HOME" -type f \( -name '*.raw' -o -name '*.ext4' -o -name '*.qcow2' \) -printf '%b %p\n' 2>&1 | sed 's/^/hostfiles after root write: /'
+g "rm /root-big && sync"
+g "n=\$(ls -l /proc/1/fd | grep -E 'upperfs|/dev/vd' | head -1); echo fdline=\$n" 2>&1 | sed 's/^/pid1fd: /'
+g "mkdir -p /tmp/up && unshare -m sh -c 'for f in /proc/1/fd/*; do if [ -d \$f ]; then echo try \$f; mount --bind \$f /tmp/up 2>&1 && grep -q upperfs /proc/self/mountinfo && echo bound \$f; fi; done; findmnt /tmp/up; fstrim -v /tmp/up' " 2>&1 | sed 's/^/trimtry: /'
+find "$MSB_HOME" -type f \( -name '*.raw' -o -name '*.ext4' -o -name '*.qcow2' \) -printf '%b %p\n' 2>&1 | sed 's/^/hostfiles after trimtry: /'
+echo "=== END DIAG"
 "$msb" stop "$name" >/dev/null 2>&1
 stopped=$(mib "$img")
 echo "image after stop: $stopped MiB allocated"
