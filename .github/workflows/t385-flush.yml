@@ -7,28 +7,8 @@
 name: t385 flush
 
 on:
-  workflow_dispatch:
-    inputs:
-      case:
-        description: "probe | counts | apt"
-        default: probe
-        type: string
-      builds:
-        description: "JSON array of fork release tags, one windows-2025 job each"
-        default: '["v0.7.8-puddle.6"]'
-        type: string
-      layouts:
-        description: "JSON array, one job per entry; an entry is comma-separated layouts run in that job (a sparse, b journal written, g grow-ahead chunks, z non-sparse zero-written, v non-sparse valid data length set)"
-        default: '["a"]'
-        type: string
-      count:
-        description: "Ops per pattern"
-        default: "50"
-        type: string
-      patterns:
-        description: "fsbench patterns"
-        default: "overwrite,overwrite-fdatasync,append,newfile"
-        type: string
+  push:
+    branches: [t385-flush]
 
 permissions:
   contents: read
@@ -48,14 +28,15 @@ jobs:
 
   measure:
     needs: fsbench
-    name: ${{ inputs.case || 'probe' }} ${{ matrix.build }} ${{ matrix.layout }}
+    name: ${{ matrix.case }} ${{ matrix.build }} ${{ matrix.layout }}
     runs-on: windows-2025
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        build: ${{ fromJSON(inputs.builds || '["v0.7.8-puddle.6"]') }}
-        layout: ${{ fromJSON(inputs.layouts || '["a"]') }}
+        case: [counts, apt]
+        build: ["v0.7.8-puddle.6", "v0.7.8-puddle.7"]
+        layout: ["a"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,11 +63,11 @@ jobs:
       - name: Measure
         shell: pwsh
         env:
-          CASE: ${{ inputs.case || 'probe' }}
+          CASE: ${{ matrix.case }}
           BUILD: ${{ matrix.build }}
           LAYOUTS: ${{ matrix.layout }}
-          COUNT: ${{ inputs.count || '50' }}
-          PATTERNS: ${{ inputs.patterns || 'overwrite,overwrite-fdatasync,append,newfile' }}
+          COUNT: 50
+          PATTERNS: overwrite,overwrite-fdatasync,append,newfile
         run: |
           New-Item -ItemType Directory -Force -Path runtime | Out-Null
           Copy-Item dl\msb-windows-x86_64.exe runtime\msb.exe -Force
@@ -106,7 +87,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: t330-${{ inputs.case || 'probe' }}-${{ matrix.build }}-${{ strategy.job-index }}
+          name: t385-${{ matrix.case }}-${{ matrix.build }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/log/
           if-no-files-found: ignore
           retention-days: 7
