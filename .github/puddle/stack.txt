@@ -54,6 +54,7 @@ pick      | feat(runtime): MSB_BLOCK_GROW_AHEAD turns block grow-ahead on or off
 pick      | fix(agentd): keep a block-backed overlay upper reachable so the root disk can be trimmed | msb-root-disk-fstrim | -
 pick      | test(puddle): the linux discard run also trims the sandbox's root disk | msb-root-disk-fstrim | -
 pick      | feat(sdk): LocalBackendBuilder takes the runtime paths explicitly and can ignore MSB_* | msb-sdk-explicit-runtime-paths | -
+pick      | fix(filesystem): refuse Windows device, trailing-dot and short-name aliases in share names | msb-windows-share-names | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -

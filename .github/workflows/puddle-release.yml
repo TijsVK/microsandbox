@@ -508,6 +508,13 @@ jobs:
           cargo test --locked -p microsandbox-vsock
           if ($LASTEXITCODE -ne 0) { throw "microsandbox-vsock tests failed" }
 
+      # Share names (F8): a guest cannot reach a device, a trailing-dot name or a short-name alias.
+      - name: microsandbox-filesystem Windows passthrough tests
+        shell: pwsh
+        run: |
+          cargo test --locked --no-default-features -p microsandbox-filesystem --lib backends::passthroughfs::windows
+          if ($LASTEXITCODE -ne 0) { throw "microsandbox-filesystem Windows tests failed" }
+
       - name: Checkout the locked libkrun fork commit
         id: krun
         shell: bash
