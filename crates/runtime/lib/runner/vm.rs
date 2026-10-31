@@ -614,6 +614,7 @@ pub fn enter(config: Config) -> ! {
         Ok(infallible) => match infallible {},
         Err(e) => {
             release_reserved_metrics_slot(metrics_slot.as_ref());
+            remove_bootstrap_roots();
             // Write the structured boot-error record so the parent CLI
             // can surface a real cause inline. Best-effort: any failure
             // to write falls back to the existing eprintln path, which
@@ -1028,6 +1029,8 @@ fn run(
                 // down).
                 exit_db.close(CATALOG_CLOSE_LIMIT).await;
             });
+
+            remove_bootstrap_roots();
 
             // Inject the exec.log lifecycle-stop marker before _exit().
             // The relay's async run() loop won't get a chance to write
@@ -2992,7 +2995,9 @@ pub(crate) const BOOTSTRAP_MOUNTPOINTS: [&str; 5] = ["dev", "sys", "proc", ".msb
 /// provider must recreate the same pathname namespace before backend restore.
 #[cfg(unix)]
 fn bootstrap_trampoline_backend(limit: usize) -> RuntimeResult<PassthroughFs> {
-    let trampoline = tempfile::tempdir()?;
+    let trampoline = tempfile::Builder::new()
+        .prefix("msb-bootstrap-root-")
+        .tempdir()?;
     for directory in BOOTSTRAP_MOUNTPOINTS {
         std::fs::create_dir(trampoline.path().join(directory)).map_err(|error| {
             RuntimeError::Custom(format!("create bootstrap mountpoint {directory}: {error}"))
@@ -3002,13 +3007,49 @@ fn bootstrap_trampoline_backend(limit: usize) -> RuntimeResult<PassthroughFs> {
         max_state_bytes: limit,
         root_dir: canonicalize_owned_mount_root(trampoline.path())?,
         no_symlink_root: true,
+        quota_bytes: Some(microsandbox_protocol::BOOTSTRAP_FS_QUOTA_BYTES),
         ..Default::default()
     };
     let backend = PassthroughFs::new(cfg)
         .map_err(|error| RuntimeError::Custom(format!("trampoline rootfs: {error}")))?;
-    let _ = trampoline.keep();
+    // The VMM leaves through `_exit()`, which would never drop a `TempDir`. Keep the folder
+    // and remove it in `remove_bootstrap_roots` when the sandbox stops or fails to start.
+    BOOTSTRAP_ROOTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(trampoline.keep());
     Ok(backend)
 }
+
+/// Host folders of the bootstrap roots this process created, removed when it ends.
+#[cfg(unix)]
+static BOOTSTRAP_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Remove the bootstrap root folders (and whatever the guest wrote into them). Best effort: a
+/// folder that is already gone is fine, and a failure is logged, never raised.
+#[cfg(unix)]
+pub(crate) fn remove_bootstrap_roots() {
+    let roots = std::mem::take(
+        &mut *BOOTSTRAP_ROOTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    remove_folders(roots);
+}
+
+#[cfg(unix)]
+fn remove_folders(roots: Vec<PathBuf>) {
+    for root in roots {
+        if let Err(error) = std::fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, path = %root.display(), "cannot remove the bootstrap root folder");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_bootstrap_roots() {}
 
 /// Recreate runtime-owned paths whose guest-visible inode identities survive a full restore.
 ///
@@ -3575,6 +3616,10 @@ fn rotation_notice(log_prefix: &str, event: &crate::logging::RotationEvent) -> S
             "puddle: cannot rotate the {log_prefix} log ({err}); \
              the log keeps growing past its limit and the rotation is retried"
         ),
+        RotationEvent::Dropping => format!(
+            "puddle: the {log_prefix} log reached its ceiling while it cannot rotate; \
+             output is dropped until the rotation works again"
+        ),
         RotationEvent::Recovered => {
             format!("puddle: the {log_prefix} log rotates again after an earlier failure")
         }
@@ -3915,9 +3960,8 @@ mod tests {
         HostPermissions, StatVirtualization, agent_kernel_cmdline, agent_primary_queue_size,
         append_block_root_env, bind_rootfs_backend, encode_bootstrap_frame, ensure_bind_root_dev,
         guest_shutdown_flush_timeout, guest_shutdown_flush_timeout_with_override,
-        parse_block_grow_ahead, parse_mount_spec,
-        prepend_scripts_path, request_guest_shutdown, request_guest_shutdown_with_timeout,
-        thp_kernel_cmdline, validate_disk_format,
+        parse_block_grow_ahead, parse_mount_spec, prepend_scripts_path, request_guest_shutdown,
+        request_guest_shutdown_with_timeout, thp_kernel_cmdline, validate_disk_format,
     };
     #[cfg(unix)]
     use super::{
@@ -4256,7 +4300,12 @@ mod tests {
         let rootfs = tempfile::tempdir().unwrap();
         std::fs::write(rootfs.path().join("probe"), b"\x7fELF").unwrap();
 
-        let fs = bind_rootfs_backend(rootfs.path(), true, msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES).unwrap();
+        let fs = bind_rootfs_backend(
+            rootfs.path(),
+            true,
+            msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES,
+        )
+        .unwrap();
         fs.init(FsOptions::empty()).unwrap();
 
         // devtmpfs needs /dev before PID 1 runs.
@@ -4295,7 +4344,10 @@ mod tests {
     fn test_bind_rootfs_that_is_refused_gets_no_dev() {
         let parent = tempfile::tempdir().unwrap();
         let missing = parent.path().join("missing");
-        assert!(bind_rootfs_backend(&missing, true, msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES).is_err());
+        assert!(
+            bind_rootfs_backend(&missing, true, msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES)
+                .is_err()
+        );
         assert!(!missing.exists());
     }
 
@@ -4309,6 +4361,103 @@ mod tests {
             fs.lookup(fs_context(), 1, &std::ffi::CString::new(directory).unwrap())
                 .unwrap();
         }
+    }
+
+    /// Feeds `len` zero bytes to a write handler, the way the virtio-fs server hands it guest data.
+    #[cfg(unix)]
+    struct ZeroReader {
+        left: usize,
+    }
+
+    #[cfg(unix)]
+    impl microsandbox_filesystem::ZeroCopyReader for ZeroReader {
+        fn read_to(&mut self, f: &std::fs::File, count: usize, off: u64) -> std::io::Result<usize> {
+            use std::os::fd::AsRawFd;
+
+            let n = count.min(self.left);
+            let zeros = vec![0u8; n];
+            // SAFETY: `zeros` is valid for `n` bytes and `f` is an open descriptor.
+            let written =
+                unsafe { libc::pwrite(f.as_raw_fd(), zeros.as_ptr().cast(), n, off as i64) };
+            if written < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            self.left -= written as usize;
+            Ok(written as usize)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_root_takes_a_bounded_flood_and_is_removed_at_exit() {
+        use microsandbox_filesystem::Extensions;
+
+        const ENOSPC: i32 = 28;
+        let fs =
+            bootstrap_trampoline_backend(msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES).unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let folder = super::BOOTSTRAP_ROOTS
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("the backend registers its folder");
+        assert!(folder.join("newroot").is_dir());
+
+        // The guest creates a file and writes far past the budget, in 1 MiB writes.
+        let name = std::ffi::CString::new("flood").unwrap();
+        let (entry, handle, _) = fs
+            .create(
+                fs_context(),
+                1,
+                &name,
+                0o644,
+                false,
+                2,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.unwrap();
+        let budget = microsandbox_protocol::BOOTSTRAP_FS_QUOTA_BYTES;
+        let mut offset = 0u64;
+        let mut refused = None;
+        for _ in 0..(budget / (1 << 20) * 4) {
+            let mut reader = ZeroReader { left: 1 << 20 };
+            match fs.write(
+                fs_context(),
+                entry.inode,
+                handle,
+                &mut reader,
+                1 << 20,
+                offset,
+                None,
+                false,
+                false,
+                0,
+            ) {
+                Ok(n) => offset += n as u64,
+                Err(error) => {
+                    refused = error.raw_os_error();
+                    break;
+                }
+            }
+        }
+        assert_eq!(refused, Some(ENOSPC), "the flood must be refused");
+        let on_disk = std::fs::metadata(folder.join("flood")).unwrap().len();
+        assert!(
+            on_disk <= budget,
+            "the file grew to {on_disk}, past {budget}"
+        );
+
+        // Other tests in this process register folders too, so remove only this one (the
+        // exit hook empties the whole registry).
+        super::BOOTSTRAP_ROOTS
+            .lock()
+            .unwrap()
+            .retain(|registered| registered != &folder);
+        super::remove_folders(vec![folder.clone(), folder.clone()]);
+        assert!(!folder.exists(), "the folder is removed, twice is fine");
     }
 
     #[test]
