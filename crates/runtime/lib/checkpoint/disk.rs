@@ -2704,6 +2704,8 @@ mod tests {
             integrity_root: None,
         };
         type Tamper<'a> = Box<dyn Fn(&mut RootDiskState) + 'a>;
+        // The link cases join on Unix only.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases: Vec<(&str, Tamper<'_>, &str)> = vec![
             (
                 "another sandbox's disk as the base, launch base kept",
