@@ -55,6 +55,7 @@ pick      | fix(agentd): keep a block-backed overlay upper reachable so the root
 pick      | test(puddle): the linux discard run also trims the sandbox's root disk | msb-root-disk-fstrim | -
 pick      | feat(sdk): LocalBackendBuilder takes the runtime paths explicitly and can ignore MSB_* | msb-sdk-explicit-runtime-paths | -
 pick      | fix(runtime): confine the root-disk journal and keep it out of the guest's share | msb-root-disk-journal-confine | -
+pick      | fix(runtime): find a root-disk journal's sandbox by its resolved path | msb-root-disk-journal-confine | -
 version   | build: version the puddle fork as*                                      | -                                       | -
 rm:.github/workflows/release.yml | ci(puddle): drop upstream's release workflow from the fork branch | -                  | -
 pick      | ci(puddle):*                                                            | -                                       | -
