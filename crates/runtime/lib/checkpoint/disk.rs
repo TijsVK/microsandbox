@@ -736,14 +736,14 @@ impl RootDiskState {
             if !configured.contains(&layer.path)
                 && !is_runtime_head_beside(&layer.path, configured, self.layout)
             {
-                confine_path(sandbox, &canonical_sandbox, &layer.path, true)
+                confine_path(&canonical_sandbox, &layer.path, true)
                     .map_err(|why| format!("root-disk journal layer {index} {why}"))?;
             }
         }
         if let Some(base) = &self.launch_base
             && !configured.contains(base)
         {
-            confine_path(sandbox, &canonical_sandbox, base, false)
+            confine_path(&canonical_sandbox, base, false)
                 .map_err(|why| format!("root-disk journal launch base {why}"))?;
         }
         Ok(())
@@ -1331,43 +1331,58 @@ fn read_confined_state(
     Ok(state)
 }
 
-/// Check that `path` lies inside `sandbox` with no link, `..` or other indirection on the way.
+/// Check that `path` lies inside the sandbox with no link, `..` or other indirection on the way.
 /// The returned text completes "root-disk journal layer N ...".
+///
+/// The walk goes up from `path` until a directory resolves to the sandbox, so a different spelling
+/// of the sandbox's own path (letter case, a verbatim prefix, a link above it) still matches,
+/// while every component below the sandbox must be a plain name that is not a link.
 fn confine_path(
-    sandbox: &Path,
     canonical_sandbox: &Path,
     path: &Path,
     must_exist: bool,
 ) -> Result<(), &'static str> {
-    let relative = path
-        .strip_prefix(sandbox)
-        .map_err(|_| "is outside its sandbox")?;
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return Err("is not a plain path inside its sandbox");
+    if !path.is_absolute() {
+        return Err("is not an absolute path");
     }
-    let mut cursor = sandbox.to_path_buf();
-    for part in relative.components() {
-        cursor.push(part);
-        match std::fs::symlink_metadata(&cursor) {
+    let mut inside = false;
+    for ancestor in path.ancestors() {
+        if ancestor != path
+            && std::fs::canonicalize(ancestor).is_ok_and(|resolved| resolved == canonical_sandbox)
+        {
+            inside = true;
+            break;
+        }
+        match ancestor.components().next_back() {
+            Some(Component::Normal(_)) => {}
+            Some(Component::CurDir | Component::ParentDir) => {
+                return Err("is not a plain path inside its sandbox");
+            }
+            _ => break,
+        }
+        match std::fs::symlink_metadata(ancestor) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err("is reached through a link");
             }
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !must_exist => {
-                return Ok(());
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if must_exist {
+                    return Err("does not exist");
+                }
             }
             Err(_) => return Err("cannot be inspected"),
         }
     }
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| "cannot be inspected")?;
-    if !metadata.is_file() {
-        return Err("is not a regular file");
+    if !inside {
+        return Err("is outside its sandbox");
     }
-    // Belt and braces for indirections symlink_metadata does not report (bind mounts aside).
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Err("is not a regular file"),
+        Err(_) if !must_exist => return Ok(()),
+        Err(_) => return Err("cannot be inspected"),
+    }
+    // Belt and braces for indirections symlink_metadata does not report.
     let canonical = std::fs::canonicalize(path).map_err(|_| "cannot be resolved")?;
     if !canonical.starts_with(canonical_sandbox) {
         return Err("resolves outside its sandbox");
@@ -2787,6 +2802,20 @@ mod tests {
         let mut restart = configured();
         recover_runtime_owned_root(&runtime, &mut restart).unwrap();
         assert!(load_runtime_owned_root_chain(&runtime).is_ok());
+
+        // Another spelling of the sandbox's own path (here a link above it) is still the sandbox.
+        #[cfg(unix)]
+        {
+            let alias = directory.path().join("alias");
+            std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+            tamper(&|state| {
+                state.launch_base = Some(upper.clone());
+                state.layers[0].path = alias.join("sandbox/upper.ext4");
+            });
+            let mut restart = configured();
+            recover_runtime_owned_root(&runtime, &mut restart).unwrap();
+            assert!(load_runtime_owned_root_chain(&runtime).is_ok());
+        }
     }
 
     /// A user-supplied root disk image may live anywhere; the host configured it, not the guest.
