@@ -105,6 +105,13 @@ pub const FS_STATE_LIMIT_MAX_MIB: u32 = 4095;
 /// Guest mount point for the runtime filesystem.
 pub const RUNTIME_MOUNT_POINT: &str = "/.msb";
 
+/// Subdirectory of the host runtime directory that is shared as [`RUNTIME_MOUNT_POINT`].
+///
+/// Only this subdirectory reaches the guest. Files the host trusts (root-disk and owned-disk
+/// journals, checkpoints, the runtime boot id, the launch config) stay in the runtime directory
+/// beside it, where the guest can neither read nor rewrite them.
+pub const RUNTIME_GUEST_DIR: &str = "guest";
+
 /// Guest directory for file mount virtiofs shares.
 pub const FILE_MOUNTS_DIR: &str = "/.msb/file-mounts";
 

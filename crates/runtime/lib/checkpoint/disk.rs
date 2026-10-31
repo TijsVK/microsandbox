@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 #[cfg(unix)]
@@ -151,7 +151,7 @@ impl RuntimeOwnedRootDisk {
             return Ok(None);
         }
         Ok(Some(Self {
-            state: read_state(&state_path)?,
+            state: read_confined_state(runtime_dir, &[])?,
             state_path,
         }))
     }
@@ -228,7 +228,11 @@ impl RuntimeOwnedRootDisk {
         };
         let state_path = runtime_dir.join(ROOT_DISK_STATE_FILE);
         let state = if state_path.exists() {
-            read_state(&state_path)?
+            let configured = configured_layers(vm, layout)?
+                .into_iter()
+                .map(|layer| layer.path)
+                .collect::<Vec<_>>();
+            read_confined_state(runtime_dir, &configured)?
         } else {
             let layers = configured_layers(vm, layout)?;
             if layers.is_empty() {
@@ -715,6 +719,36 @@ impl RootDiskState {
         Ok(())
     }
 
+    /// Refuse a journal that points the host at a file the sandbox does not own.
+    ///
+    /// Every layer must be a regular file inside the sandbox directory (the runtime directory's
+    /// parent) reached without a link or `..`, or a path the host itself configured for this
+    /// boot (a user-supplied root disk image may live anywhere). A head that rollover created
+    /// beside such an image is accepted under the runtime's own naming scheme only.
+    /// `launch_base` follows the same rule, but it may name a file that no longer exists.
+    fn confine(&self, runtime_dir: &Path, configured: &[PathBuf]) -> Result<(), String> {
+        let sandbox = runtime_dir
+            .parent()
+            .ok_or("runtime directory has no sandbox parent")?;
+        let canonical_sandbox = std::fs::canonicalize(sandbox)
+            .map_err(|error| format!("resolve sandbox directory: {error}"))?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            if !configured.contains(&layer.path)
+                && !is_runtime_head_beside(&layer.path, configured, self.layout)
+            {
+                confine_path(sandbox, &canonical_sandbox, &layer.path, true)
+                    .map_err(|why| format!("root-disk journal layer {index} {why}"))?;
+            }
+        }
+        if let Some(base) = &self.launch_base
+            && !configured.contains(base)
+        {
+            confine_path(sandbox, &canonical_sandbox, base, false)
+                .map_err(|why| format!("root-disk journal launch base {why}"))?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "runner")]
     fn disk_spec(&self) -> UpperSpec {
         UpperSpec {
@@ -867,6 +901,11 @@ pub(crate) fn recover_runtime_owned_root(
     if configured_base != journal_base {
         return Err("root-disk journal does not match the configured base layer".into());
     }
+    let configured = configured
+        .into_iter()
+        .map(|layer| layer.path)
+        .collect::<Vec<_>>();
+    state.confine(runtime_dir, &configured)?;
     match state.layout {
         RootDiskLayout::ManagedUpper => {
             vm.rootfs_upper = None;
@@ -892,7 +931,7 @@ pub fn load_runtime_owned_root_chain(
     if !state_path.exists() {
         return Ok(None);
     }
-    let state = read_state(&state_path)?;
+    let state = read_confined_state(runtime_dir, &[])?;
     if state.growth_target.is_some() {
         return Err("complete pending root-disk growth before snapshotting".into());
     }
@@ -939,7 +978,7 @@ pub fn grow_stopped_root(runtime_dir: &Path, target: u64) -> Result<bool, String
     if !state_path.exists() {
         return Ok(false);
     }
-    let state = read_state(&state_path)?;
+    let state = read_confined_state(runtime_dir, &[])?;
     if state.growth_target.is_some_and(|pending| pending != target) {
         return Err(format!(
             "complete pending root-disk growth to {} bytes first",
@@ -1038,7 +1077,7 @@ pub fn compact_stopped_root(
         });
     }
     let mut disk = RuntimeOwnedRootDisk {
-        state: read_state(&state_path)?,
+        state: read_confined_state(runtime_dir, &[])?,
         state_path,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1280,6 +1319,81 @@ fn read_state(path: &Path) -> Result<RootDiskState, String> {
         .map_err(|error| format!("parse root-disk state: {error}"))?;
     state.validate()?;
     Ok(state)
+}
+
+/// Read the journal of `runtime_dir` and confine it to its sandbox (see [`RootDiskState::confine`]).
+fn read_confined_state(
+    runtime_dir: &Path,
+    configured: &[PathBuf],
+) -> Result<RootDiskState, String> {
+    let state = read_state(&runtime_dir.join(ROOT_DISK_STATE_FILE))?;
+    state.confine(runtime_dir, configured)?;
+    Ok(state)
+}
+
+/// Check that `path` lies inside `sandbox` with no link, `..` or other indirection on the way.
+/// The returned text completes "root-disk journal layer N ...".
+fn confine_path(
+    sandbox: &Path,
+    canonical_sandbox: &Path,
+    path: &Path,
+    must_exist: bool,
+) -> Result<(), &'static str> {
+    let relative = path
+        .strip_prefix(sandbox)
+        .map_err(|_| "is outside its sandbox")?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("is not a plain path inside its sandbox");
+    }
+    let mut cursor = sandbox.to_path_buf();
+    for part in relative.components() {
+        cursor.push(part);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("is reached through a link");
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !must_exist => {
+                return Ok(());
+            }
+            Err(_) => return Err("cannot be inspected"),
+        }
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| "cannot be inspected")?;
+    if !metadata.is_file() {
+        return Err("is not a regular file");
+    }
+    // Belt and braces for indirections symlink_metadata does not report (bind mounts aside).
+    let canonical = std::fs::canonicalize(path).map_err(|_| "cannot be resolved")?;
+    if !canonical.starts_with(canonical_sandbox) {
+        return Err("resolves outside its sandbox");
+    }
+    Ok(())
+}
+
+/// A head that rollover placed next to a configured layer outside the sandbox
+/// (see `next_overlay_path`): same directory, runtime-generated name, a plain file.
+fn is_runtime_head_beside(path: &Path, configured: &[PathBuf], layout: RootDiskLayout) -> bool {
+    let prefix = match layout {
+        RootDiskLayout::ManagedUpper => "upper-",
+        RootDiskLayout::FlatRoot => "root-",
+    };
+    let generated = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(prefix))
+        .and_then(|name| name.strip_suffix(".qcow2"))
+        .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    generated
+        && configured
+            .iter()
+            .any(|layer| layer.parent().is_some() && layer.parent() == path.parent())
+        && std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
 fn write_state(path: &Path, state: &RootDiskState) -> Result<(), String> {
@@ -2524,5 +2638,214 @@ mod tests {
 
         assert_eq!(parsed.layout, RootDiskLayout::ManagedUpper);
         parsed.validate().unwrap();
+    }
+
+    /// A guest that rewrote its journal (GHSA-3f94-vm6x-3jv3) gets no other file on restart.
+    #[test]
+    #[cfg(feature = "runner")]
+    fn restart_refuses_a_journal_that_leaves_the_sandbox() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox = directory.path().join("sandbox");
+        let runtime = sandbox.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let upper = sandbox.join("upper.ext4");
+        std::fs::write(&upper, vec![0u8; 131072]).unwrap();
+        let other = directory.path().join("other-sandbox");
+        std::fs::create_dir(&other).unwrap();
+        let victim = other.join("upper.ext4");
+        std::fs::write(&victim, b"another sandbox's disk").unwrap();
+        let configured = || {
+            root_vm(
+                RootDiskLayout::ManagedUpper,
+                vec![UpperLayerSpec {
+                    path: upper.clone(),
+                    format: msb_krun::DiskImageFormat::Raw,
+                }],
+            )
+        };
+
+        // First boot writes the journal; a legitimate restart attaches the sandbox's own disk.
+        RuntimeOwnedRootDisk::open(&runtime, &configured())
+            .unwrap()
+            .unwrap();
+        let journal = runtime.join(ROOT_DISK_STATE_FILE);
+        let genuine = std::fs::read(&journal).unwrap();
+        let mut restart = configured();
+        recover_runtime_owned_root(&runtime, &mut restart).unwrap();
+        let attached = configured_layers(&restart, RootDiskLayout::ManagedUpper).unwrap();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].path, upper);
+
+        let tamper = |edit: &dyn Fn(&mut RootDiskState)| {
+            let mut state: RootDiskState = serde_json::from_slice(&genuine).unwrap();
+            edit(&mut state);
+            std::fs::write(&journal, serde_json::to_vec(&state).unwrap()).unwrap();
+        };
+        let layer = |path: PathBuf, format: RootDiskFormat| RootDiskLayer {
+            layer_id: new_id("layer"),
+            path,
+            format,
+            integrity_root: None,
+        };
+        type Tamper<'a> = Box<dyn Fn(&mut RootDiskState) + 'a>;
+        let mut cases: Vec<(&str, Tamper<'_>, &str)> = vec![
+            (
+                "another sandbox's disk as the base, launch base kept",
+                Box::new(|state| {
+                    state.launch_base = Some(upper.clone());
+                    state.layers = vec![layer(victim.clone(), RootDiskFormat::Raw)];
+                }),
+                "outside its sandbox",
+            ),
+            (
+                "a host file as a qcow2 head over the genuine base",
+                Box::new(|state| {
+                    state.layers = vec![
+                        layer(upper.clone(), RootDiskFormat::Raw),
+                        layer(victim.clone(), RootDiskFormat::Qcow2),
+                    ];
+                }),
+                "layer 1 is outside its sandbox",
+            ),
+            (
+                "a `..` walk out of the sandbox",
+                Box::new(|state| {
+                    state.launch_base = Some(upper.clone());
+                    state.layers = vec![layer(
+                        runtime.join("../../other-sandbox/upper.ext4"),
+                        RootDiskFormat::Raw,
+                    )];
+                }),
+                "not a plain path",
+            ),
+            (
+                "a launch base outside the sandbox",
+                Box::new(|state| {
+                    state.launch_base = Some(victim.clone());
+                    state.layers = vec![layer(victim.clone(), RootDiskFormat::Raw)];
+                }),
+                "configured base layer",
+            ),
+        ];
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&victim, sandbox.join("link.ext4")).unwrap();
+            std::os::unix::fs::symlink(&other, sandbox.join("disks")).unwrap();
+            cases.push((
+                "a link to another sandbox's disk",
+                Box::new(|state| {
+                    state.launch_base = Some(upper.clone());
+                    state.layers = vec![layer(sandbox.join("link.ext4"), RootDiskFormat::Raw)];
+                }),
+                "through a link",
+            ));
+            cases.push((
+                "a linked directory",
+                Box::new(|state| {
+                    state.launch_base = Some(upper.clone());
+                    state.layers =
+                        vec![layer(sandbox.join("disks/upper.ext4"), RootDiskFormat::Raw)];
+                }),
+                "through a link",
+            ));
+        }
+        for (name, edit, expected) in &cases {
+            tamper(edit.as_ref());
+            let mut restart = configured();
+            let error = recover_runtime_owned_root(&runtime, &mut restart).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+            // The start keeps the configured disk; nothing from the journal was applied.
+            assert!(restart.rootfs_upper_spec.is_some(), "{name}");
+            assert_eq!(
+                configured_layers(&restart, RootDiskLayout::ManagedUpper).unwrap()[0].path,
+                upper,
+                "{name}"
+            );
+            assert!(
+                RuntimeOwnedRootDisk::open(&runtime, &configured()).is_err(),
+                "{name}: checkpoint coordinator"
+            );
+            assert!(
+                load_runtime_owned_root_chain(&runtime).is_err(),
+                "{name}: snapshot"
+            );
+            assert!(grow_stopped_root(&runtime, 262144).is_err(), "{name}: grow");
+            assert!(
+                compact_stopped_root(&runtime, None, true).is_err(),
+                "{name}: compact"
+            );
+            assert!(
+                RuntimeOwnedRootDisk::read(&runtime).is_err(),
+                "{name}: read"
+            );
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"another sandbox's disk");
+
+        // Undoing the tamper restores a working restart: the check refuses paths, not sandboxes.
+        std::fs::write(&journal, &genuine).unwrap();
+        let mut restart = configured();
+        recover_runtime_owned_root(&runtime, &mut restart).unwrap();
+        assert!(load_runtime_owned_root_chain(&runtime).is_ok());
+    }
+
+    /// A user-supplied root disk image may live anywhere; the host configured it, not the guest.
+    #[test]
+    #[cfg(feature = "runner")]
+    fn restart_keeps_a_configured_disk_image_outside_the_sandbox() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("sandbox/runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let images = directory.path().join("images");
+        std::fs::create_dir(&images).unwrap();
+        let image = images.join("root.raw");
+        std::fs::write(&image, vec![0u8; 131072]).unwrap();
+        let configured = || {
+            root_vm(
+                RootDiskLayout::ManagedUpper,
+                vec![UpperLayerSpec {
+                    path: image.clone(),
+                    format: msb_krun::DiskImageFormat::Raw,
+                }],
+            )
+        };
+        RuntimeOwnedRootDisk::open(&runtime, &configured())
+            .unwrap()
+            .unwrap();
+        let mut restart = configured();
+        recover_runtime_owned_root(&runtime, &mut restart).unwrap();
+        RuntimeOwnedRootDisk::open(&runtime, &restart)
+            .unwrap()
+            .unwrap();
+
+        // A rollover head beside the image (next_overlay_path) is the runtime's own file.
+        let journal = runtime.join(ROOT_DISK_STATE_FILE);
+        let mut state = read_state(&journal).unwrap();
+        let head = next_overlay_path(&image, RootDiskLayout::ManagedUpper);
+        std::fs::write(&head, b"qcow2 head").unwrap();
+        state.layers.push(RootDiskLayer {
+            layer_id: new_id("layer"),
+            path: head.clone(),
+            format: RootDiskFormat::Qcow2,
+            integrity_root: None,
+        });
+        write_state(&journal, &state).unwrap();
+        let mut restart = configured();
+        recover_runtime_owned_root(&runtime, &mut restart).unwrap();
+        let attached = configured_layers(&restart, RootDiskLayout::ManagedUpper).unwrap();
+        assert_eq!(attached[1].path, head);
+
+        // Any other file beside the image is not.
+        let neighbour = images.join("someone-else.qcow2");
+        std::fs::write(&neighbour, b"other image").unwrap();
+        state.layers[1].path = neighbour;
+        write_state(&journal, &state).unwrap();
+        let mut restart = configured();
+        assert!(
+            recover_runtime_owned_root(&runtime, &mut restart)
+                .unwrap_err()
+                .contains("layer 1 is outside its sandbox")
+        );
     }
 }

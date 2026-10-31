@@ -394,7 +394,9 @@ pub async fn spawn_sandbox(
     let sandbox_dir = global.sandboxes_dir().join(&config.spec.name);
     let log_dir = sandbox_dir.join("logs");
     let runtime_dir = sandbox_dir.join("runtime");
-    let scripts_dir = runtime_dir.join("scripts");
+    // The guest sees only this part of the runtime directory, as `/.msb`.
+    let guest_runtime_dir = runtime_dir.join(microsandbox_protocol::RUNTIME_GUEST_DIR);
+    let scripts_dir = guest_runtime_dir.join("scripts");
     let db_dir = global.home().join(DB_SUBDIR);
     let db_path = db_dir.join(DB_FILENAME);
 
@@ -451,7 +453,7 @@ pub async fn spawn_sandbox(
         tokio::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).await?;
         #[cfg(windows)]
         microsandbox_filesystem::PassthroughFs::set_path_virtual_permissions(
-            &runtime_dir,
+            &guest_runtime_dir,
             &script_path,
             0,
             0,

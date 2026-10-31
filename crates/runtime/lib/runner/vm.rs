@@ -708,15 +708,16 @@ fn run(
 
     // Set up runtime directory.
     std::fs::create_dir_all(&config.runtime_dir)?;
-    std::fs::create_dir_all(config.runtime_dir.join("scripts"))?;
+    let guest_dir = prepare_guest_runtime_dir(&config.runtime_dir)?;
+    std::fs::create_dir_all(guest_dir.join("scripts"))?;
     crate::checkpoint::recover_runtime_owned_root(&config.runtime_dir, &mut config.vm).map_err(
         |error| RuntimeError::Custom(format!("recover runtime-owned root disk: {error}")),
     )?;
     recover_owned_disk_layers(&config.runtime_dir, &mut config.vm.disks)?;
     // Heartbeats are per boot, while the runtime directory persists across starts.
-    heartbeat::clear_stale(&config.runtime_dir)?;
+    heartbeat::clear_stale(&guest_dir)?;
     if config.vm.checkpoint_restore.is_some() {
-        prepare_runtime_restore_namespace(&config.runtime_dir, config.vm.rootfs_vmdk.is_some())?;
+        prepare_runtime_restore_namespace(&guest_dir, config.vm.rootfs_vmdk.is_some())?;
     }
 
     #[cfg(unix)]
@@ -1509,7 +1510,7 @@ fn run(
     // heartbeat is NOT treated as a failure here — a busy agent is still healthy,
     // and a guest that never boots is reclaimed by the relay's wait_ready path.
     {
-        let mut heartbeat_reader = HeartbeatReader::new(&config.runtime_dir);
+        let mut heartbeat_reader = HeartbeatReader::new(&guest_runtime_dir(&config.runtime_dir));
         let idle_timeout = config.idle_timeout_secs.map(Duration::from_secs);
         let heartbeat_exit_handle = exit_handle.clone();
         let heartbeat_reason = Arc::clone(&exit_reason);
@@ -2100,15 +2101,16 @@ fn build_vm(
     // Runtime directory mount — agentd mounts this at /.msb for scripts
     // and heartbeat. It is a host↔guest control channel (the host writes
     // scripts/TLS certs and reads heartbeat.json through it), so it stays a
-    // virtiofs share rather than a block device. A fixed budget caps guest
-    // writes so the channel can never be used to fill the host disk; the
+    // virtiofs share rather than a block device. Only its `guest/` subfolder
+    // is shared: the journals and other files the host trusts stay beside
+    // it. A fixed budget caps guest writes so the channel can never be used to fill the host disk; the
     // legitimate guest footprint is a ~1 KiB heartbeat, so the budget is
     // almost entirely abuse headroom and is not user-configurable.
     {
         let runtime_tag = microsandbox_protocol::RUNTIME_FS_TAG.to_string();
         let cfg = PassthroughConfig {
             max_state_bytes: vm.fs_state_limit(),
-            root_dir: canonicalize_owned_mount_root(&config.runtime_dir)?,
+            root_dir: canonicalize_owned_mount_root(&guest_runtime_dir(&config.runtime_dir))?,
             inject_init: false,
             quota_bytes: Some(microsandbox_protocol::RUNTIME_FS_QUOTA_BYTES),
             no_symlink_root: true,
@@ -2664,7 +2666,7 @@ fn build_vm(
         let net_backend = network.take_backend();
 
         {
-            let tls_dir = config.runtime_dir.join("tls");
+            let tls_dir = guest_runtime_dir(&config.runtime_dir).join("tls");
             let _ = std::fs::create_dir_all(&tls_dir);
             if let Some(ca_pem) = network.ca_cert_pem() {
                 let _ = std::fs::write(tls_dir.join("ca.pem"), &ca_pem);
@@ -3016,10 +3018,10 @@ fn bootstrap_trampoline_backend(limit: usize) -> RuntimeResult<PassthroughFs> {
 /// not source host descriptors, so paths created by agentd before capture must exist before device
 /// restore. OCI roots use the two mountpoints while every restored agent session may retain the
 /// atomically published heartbeat pathname. Existing heartbeat contents are never truncated.
-fn prepare_runtime_restore_namespace(runtime_dir: &Path, oci_root: bool) -> RuntimeResult<()> {
+fn prepare_runtime_restore_namespace(guest_dir: &Path, oci_root: bool) -> RuntimeResult<()> {
     if oci_root {
         for directory in ["rootfs/lower", "rootfs/upperfs"] {
-            std::fs::create_dir_all(runtime_dir.join(directory)).map_err(|error| {
+            std::fs::create_dir_all(guest_dir.join(directory)).map_err(|error| {
                 RuntimeError::Custom(format!(
                     "create restored runtime mountpoint {directory}: {error}"
                 ))
@@ -3027,7 +3029,7 @@ fn prepare_runtime_restore_namespace(runtime_dir: &Path, oci_root: bool) -> Runt
         }
     }
 
-    let heartbeat = runtime_dir.join("heartbeat.json");
+    let heartbeat = guest_dir.join("heartbeat.json");
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3086,6 +3088,33 @@ fn ensure_bind_root_dev(rootfs_path: &Path) {
             tracing::warn!(path = %dev.display(), %error, "could not create /dev in the bind rootfs");
         }
     }
+}
+
+/// The part of the runtime directory that the guest sees as `/.msb`.
+pub(crate) fn guest_runtime_dir(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(microsandbox_protocol::RUNTIME_GUEST_DIR)
+}
+
+/// Create the guest's share inside the runtime directory and return it.
+///
+/// Before this split the whole runtime directory was guest-writable, so an older guest may have
+/// left a file or a link under the name. The runtime never creates anything there but this
+/// directory, so whatever else holds the name is removed (a link itself, never its target).
+fn prepare_guest_runtime_dir(runtime_dir: &Path) -> RuntimeResult<PathBuf> {
+    let guest = guest_runtime_dir(runtime_dir);
+    match std::fs::symlink_metadata(&guest) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            // A Windows directory link only goes with remove_dir, which never follows it.
+            std::fs::remove_file(&guest).or_else(|_| std::fs::remove_dir(&guest))?;
+            std::fs::create_dir(&guest)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&guest)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(guest)
 }
 
 /// Canonicalize a microsandbox-owned mount root so it is symlink-free.
@@ -3925,8 +3954,9 @@ mod tests {
         bind_identity_map_for_mount, bootstrap_trampoline_backend, read_parent_watchdog_signal,
     };
     use super::{
-        DiskMountSpec, UpperLayerSpec, UpperSpec, prepare_runtime_restore_namespace,
-        recover_owned_disk_layers, validate_disk_mount_layers, validate_upper_layers,
+        DiskMountSpec, UpperLayerSpec, UpperSpec, prepare_guest_runtime_dir,
+        prepare_runtime_restore_namespace, recover_owned_disk_layers, validate_disk_mount_layers,
+        validate_upper_layers,
     };
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
@@ -4337,6 +4367,55 @@ mod tests {
         prepare_runtime_restore_namespace(disk_runtime.path(), false).unwrap();
         assert!(!disk_runtime.path().join("rootfs").exists());
         assert!(disk_runtime.path().join("heartbeat.json").is_file());
+    }
+
+    /// The guest's `/.msb` holds only the guest subfolder; the journals stay beside it.
+    #[test]
+    fn guest_share_is_a_subfolder_without_the_host_journals() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let runtime = sandbox.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("root-disk.json"), b"{}").unwrap();
+
+        let guest = prepare_guest_runtime_dir(&runtime).unwrap();
+        assert_eq!(
+            guest,
+            runtime.join(microsandbox_protocol::RUNTIME_GUEST_DIR)
+        );
+        assert!(guest.is_dir());
+        assert_eq!(std::fs::read_dir(&guest).unwrap().count(), 0);
+        assert!(!guest.join("root-disk.json").exists());
+
+        // A restart keeps what the guest wrote there.
+        std::fs::write(guest.join("heartbeat.json"), b"beat").unwrap();
+        prepare_guest_runtime_dir(&runtime).unwrap();
+        assert_eq!(
+            std::fs::read(guest.join("heartbeat.json")).unwrap(),
+            b"beat"
+        );
+
+        // An older guest could write the whole runtime folder: a file it left under the name
+        // gives way, and so does a link, without touching the link's target.
+        std::fs::remove_dir_all(&guest).unwrap();
+        std::fs::write(&guest, b"planted").unwrap();
+        prepare_guest_runtime_dir(&runtime).unwrap();
+        assert!(guest.is_dir());
+        #[cfg(unix)]
+        {
+            let elsewhere = sandbox.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("keep"), b"keep").unwrap();
+            std::fs::remove_dir(&guest).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &guest).unwrap();
+            prepare_guest_runtime_dir(&runtime).unwrap();
+            let metadata = std::fs::symlink_metadata(&guest).unwrap();
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            assert_eq!(std::fs::read(elsewhere.join("keep")).unwrap(), b"keep");
+        }
+        assert_eq!(
+            std::fs::read(runtime.join("root-disk.json")).unwrap(),
+            b"{}"
+        );
     }
 
     #[test]
