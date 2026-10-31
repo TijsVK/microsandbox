@@ -39,7 +39,7 @@ jobs:
 
       - name: Show whether the volume makes 8.3 short names
         shell: pwsh
-        run: fsutil 8dot3name query C:
+        run: fsutil 8dot3name query 'C:'
 
       - name: microsandbox-filesystem Windows passthrough tests
         shell: pwsh
