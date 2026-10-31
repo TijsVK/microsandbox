@@ -13,6 +13,8 @@
 name: puddle root journal
 
 on:
+  push:
+    branches: [task/t882-root-disk-journal-ci]
   workflow_call:
     inputs:
       ref:
